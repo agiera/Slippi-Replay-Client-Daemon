@@ -1,0 +1,63 @@
+{
+  "name": "slippi-replay-client-daemon",
+  "version": "0.1.0",
+  "description": "Cross-platform tray daemon that watches a directory and uploads new Slippi replay files.",
+  "homepage": "https://github.com/agiera/slippi-replay-client-daemon",
+  "main": "main.js",
+  "author": {
+    "name": "Aaron Giera",
+    "email": "aaron.giera@gmail.com"
+  },
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder",
+    "build:linux": "electron-builder --linux AppImage",
+    "build:windows": "electron-builder --win",
+    "build:mac": "electron-builder --mac"
+  },
+  "build": {
+    "appId": "com.agiera.slippi-replay-client-daemon",
+    "productName": "Slippi Replay Sync",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "src/**/*",
+      "resources/**/*",
+      ".env.example"
+    ],
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "category": "Utility",
+      "maintainer": "Aaron Giera <aaron.giera@gmail.com>"
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    },
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "category": "public.app-category.utilities"
+    }
+  },
+  "dependencies": {
+    "axios": "^1.10.0",
+    "chokidar": "^4.0.3",
+    "dotenv": "^16.5.0",
+    "form-data": "^4.0.4",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "electron": "^38.2.2",
+    "electron-builder": "^24.13.3"
+  }
+}
