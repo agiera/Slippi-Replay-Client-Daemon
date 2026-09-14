@@ -3,6 +3,7 @@ const path = require("path");
 const crypto = require("crypto");
 const axios = require("axios");
 const FormData = require("form-data");
+const { isSlpFileComplete, streamSlpUpload } = require("./streamUpload");
 
 function sha256File(filePath) {
   return new Promise((resolve, reject) => {
@@ -15,8 +16,26 @@ function sha256File(filePath) {
   });
 }
 
-function buildUploadUrl(serverUrl, uploadPath) {
-  const safeServerUrl = serverUrl.endsWith("/") ? serverUrl.slice(0, -1) : serverUrl;
+// Wait until a file's size stops changing so a full (non-streaming) upload never
+// reads a file that is still being copied/written. Bounded to ~10s.
+async function waitForStableSize(filePath) {
+  let lastSize = -1;
+  for (let i = 0; i < 20; i += 1) {
+    let size;
+    try {
+      size = fs.statSync(filePath).size;
+    } catch {
+      return;
+    }
+    if (size === lastSize) {
+      return;
+    }
+    lastSize = size;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+}
+
+function buildUploadUrl(serverUrl, uploadPath) {  const safeServerUrl = serverUrl.endsWith("/") ? serverUrl.slice(0, -1) : serverUrl;
   const safePath = uploadPath.startsWith("/") ? uploadPath : `/${uploadPath}`;
   return `${safeServerUrl}${safePath}`;
 }
@@ -32,6 +51,9 @@ function buildReplayListUrl(serverUrl, uploadPath) {
 function createUploader({ getConfig, getState, persistState, onStatus, onLog, onError }) {
   const queue = [];
   const queued = new Set();
+  // Files currently queued or being uploaded/streamed; prevents the watcher's
+  // repeated `change` events during a live game from re-enqueuing the same file.
+  const active = new Set();
   let processing = false;
 
   async function uploadOne(filePath) {
@@ -59,6 +81,8 @@ function createUploader({ getConfig, getState, persistState, onStatus, onLog, on
     if (!stat.isFile()) {
       return;
     }
+
+    await waitForStableSize(filePath);
 
     const hash = await sha256File(filePath);
     if (state.uploaded[hash]) {
@@ -99,6 +123,64 @@ function createUploader({ getConfig, getState, persistState, onStatus, onLog, on
 
     onStatus(`Uploaded: ${path.basename(filePath)}`);
     onLog(`Upload successful for ${filePath}`);
+  }
+
+  async function streamOne(filePath) {
+    const config = getConfig();
+    const state = getState();
+
+    if (!config.apiToken) {
+      onStatus("Upload skipped: API token missing");
+      onError("Upload skipped because API token is not configured");
+      return;
+    }
+
+    if (!config.serverUrl) {
+      onStatus("Upload skipped: server URL missing");
+      onError("Upload skipped because server URL is not configured");
+      return;
+    }
+
+    if (!fs.existsSync(filePath)) {
+      onStatus(`Skipped missing file: ${path.basename(filePath)}`);
+      return;
+    }
+
+    onStatus(`Streaming live: ${path.basename(filePath)}`);
+    onLog(`Live-streaming ${filePath} to server as it is written`);
+
+    const result = await streamSlpUpload({ filePath, config, onLog });
+
+    // The content hash is only known once the live stream ends; record it so a
+    // later scan of the now-complete file is deduped instead of re-uploaded.
+    state.uploaded[result.hash] = {
+      fileName: path.basename(filePath),
+      filePath,
+      remoteName: result.remoteName,
+      remoteFolder: result.remoteFolder,
+      uploadedAt: new Date().toISOString(),
+      sizeBytes: result.sizeBytes,
+    };
+    persistState();
+
+    onStatus(`Uploaded (live): ${path.basename(filePath)}`);
+    onLog(`Live upload complete for ${filePath} (${result.sizeBytes} bytes)`);
+  }
+
+  async function processOne(filePath) {
+    if (filePath.toLowerCase().endsWith(".slp")) {
+      let complete = true;
+      try {
+        complete = await isSlpFileComplete(filePath);
+      } catch {
+        complete = true;
+      }
+      if (!complete) {
+        await streamOne(filePath);
+        return;
+      }
+    }
+    await uploadOne(filePath);
   }
 
   async function reconcileWithServer() {
@@ -178,7 +260,7 @@ function createUploader({ getConfig, getState, persistState, onStatus, onLog, on
       while (attempts < 3 && !uploaded) {
         try {
           attempts += 1;
-          await uploadOne(filePath);
+          await processOne(filePath);
           uploaded = true;
         } catch (error) {
           const message = error?.response?.data?.detail || error?.message || "upload failed";
@@ -189,15 +271,18 @@ function createUploader({ getConfig, getState, persistState, onStatus, onLog, on
           }
         }
       }
+
+      active.delete(filePath);
     }
     processing = false;
   }
 
   function enqueue(filePath) {
-    if (queued.has(filePath)) {
+    if (queued.has(filePath) || active.has(filePath)) {
       return;
     }
     queued.add(filePath);
+    active.add(filePath);
     queue.push(filePath);
     processQueue();
   }

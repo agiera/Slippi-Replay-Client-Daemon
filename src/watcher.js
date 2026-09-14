@@ -55,13 +55,15 @@ function createWatcher({ watchDir, includeExtensions, pollIntervalMs, onCandidat
       return;
     }
 
+    // No awaitWriteFinish: live console-mirrored .slp files are picked up as soon
+    // as they appear so they can be streamed while still being written. The
+    // uploader routes incomplete .slp files to live streaming and waits for a
+    // stable size before fully uploading complete files, so early events are safe.
     watcher = chokidar.watch(watchDir, {
       persistent: true,
       ignoreInitial: true,
-      awaitWriteFinish: {
-        stabilityThreshold: 2000,
-        pollInterval: Math.max(200, pollIntervalMs),
-      },
+      usePolling: true,
+      interval: Math.max(200, pollIntervalMs),
     });
 
     watcher.on("add", enqueueIfReplay);
