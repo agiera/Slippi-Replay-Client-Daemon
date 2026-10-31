@@ -101,3 +101,12 @@ The daemon sends `multipart/form-data` with field name `file` and includes both 
 Your server upload endpoint should accept one of these auth methods and a replay file payload.
 Full uploads also send `X-Content-SHA256: <hex digest>`; a `409` response is
 treated as "already uploaded" and recorded like a success.
+
+Before uploading a file, and at startup to verify its local "already uploaded"
+records, the daemon calls `POST <upload path>/check` with
+`{"hashes": ["<sha256>", ...]}` (up to 1000 per request). The server replies
+`{"existing": {"<sha256>": {"folder": ..., "name": ...}}}` for hashes it
+already stores. Files the server already has are never re-sent, and records the
+server no longer has are dropped so those files upload again. Servers without
+this endpoint (`404`) are still supported: uploads proceed and the startup check
+is skipped.

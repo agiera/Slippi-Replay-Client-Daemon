@@ -6,6 +6,8 @@ const FormData = require("form-data");
 const { isSlpFileComplete, streamSlpUpload } = require("./streamUpload");
 
 const UPLOAD_CONCURRENCY = 2;
+// Server-side limit on hashes per /check request.
+const CHECK_BATCH_SIZE = 1000;
 const MAX_ATTEMPTS = 3;
 // Files untouched for this long are assumed fully written and skip the size poll.
 const SETTLED_AGE_MS = 2000;
@@ -51,12 +53,9 @@ function buildUploadUrl(serverUrl, uploadPath) {
   return `${safeServerUrl}${safePath}`;
 }
 
-function buildReplayListUrl(serverUrl, uploadPath) {
-  const normalizedUploadPath = uploadPath.startsWith("/") ? uploadPath : `/${uploadPath}`;
-  const replayPath = normalizedUploadPath.endsWith("/uploads/files")
-    ? normalizedUploadPath.replace(/\/uploads\/files$/, "/replays/files")
-    : "/api/v1/replays/files";
-  return buildUploadUrl(serverUrl, replayPath);
+function buildCheckUrl(serverUrl, uploadPath) {
+  const base = buildUploadUrl(serverUrl, uploadPath);
+  return `${base.endsWith("/") ? base.slice(0, -1) : base}/check`;
 }
 
 function authHeaders(config) {
@@ -115,6 +114,32 @@ function createUploader({ getConfig, getState, persistState, onStatus, onLog, on
     return true;
   }
 
+  // Ask the server which content hashes it already stores for this token's
+  // repository. Returns a Map of hash -> { folder, name }, or null when the
+  // server predates the check endpoint.
+  async function checkHashes(config, hashes) {
+    const existing = new Map();
+    for (let i = 0; i < hashes.length; i += CHECK_BATCH_SIZE) {
+      let response;
+      try {
+        response = await axios.post(
+          buildCheckUrl(config.serverUrl, config.uploadPath),
+          { hashes: hashes.slice(i, i + CHECK_BATCH_SIZE) },
+          { headers: authHeaders(config), timeout: 30000 },
+        );
+      } catch (error) {
+        if ([404, 405].includes(error?.response?.status)) {
+          return null;
+        }
+        throw error;
+      }
+      for (const [hash, info] of Object.entries(response?.data?.existing || {})) {
+        existing.set(hash, info);
+      }
+    }
+    return existing;
+  }
+
   async function uploadOne(filePath) {
     const config = getConfig();
     const state = getState();
@@ -137,6 +162,26 @@ function createUploader({ getConfig, getState, persistState, onStatus, onLog, on
       filesIndex(state)[filePath] = { size: stat.size, mtimeMs: stat.mtimeMs, hash };
       persistState();
       onStatus(`Already uploaded: ${path.basename(filePath)}`);
+      return;
+    }
+
+    let onServer = null;
+    try {
+      onServer = (await checkHashes(config, [hash]))?.get(hash) || null;
+    } catch (error) {
+      // Not fatal: the upload itself still deduplicates via a 409.
+      onLog(`Hash check failed for ${filePath}: ${error?.message || error}`);
+    }
+    if (onServer) {
+      recordUpload(state, {
+        filePath,
+        hash,
+        stat,
+        remoteName: onServer.name || path.basename(filePath),
+        remoteFolder: onServer.folder || null,
+      });
+      onStatus(`Already on server: ${path.basename(filePath)}`);
+      onLog(`Server already has ${filePath}; skipped upload`);
       return;
     }
 
@@ -200,7 +245,8 @@ function createUploader({ getConfig, getState, persistState, onStatus, onLog, on
     const result = await streamSlpUpload({ filePath, config, onLog });
 
     // The game-end header patch means the file on disk no longer matches the bytes
-    // streamed, so record the final file's hash too; later scans then dedupe it.
+    // streamed; the server finalizes the stream the same way, so record the final
+    // file's hash so later scans and server checks match it.
     let stat = null;
     let fileHash = null;
     try {
@@ -210,17 +256,13 @@ function createUploader({ getConfig, getState, persistState, onStatus, onLog, on
       // File vanished after streaming; only the streamed hash can be recorded.
     }
 
-    const remote = { remoteName: result.remoteName, remoteFolder: result.remoteFolder };
     recordUpload(state, {
       filePath,
       hash: fileHash || result.hash,
       stat: stat || { size: result.sizeBytes, mtimeMs: null },
-      ...remote,
+      remoteName: result.remoteName,
+      remoteFolder: result.remoteFolder,
     });
-    if (fileHash && fileHash !== result.hash) {
-      state.uploaded[result.hash] = { ...state.uploaded[fileHash], sizeBytes: result.sizeBytes };
-      persistState();
-    }
 
     onStatus(`Uploaded (live): ${path.basename(filePath)}`);
     onLog(`Live upload complete for ${filePath} (${result.sizeBytes} bytes)`);
@@ -317,6 +359,8 @@ function createUploader({ getConfig, getState, persistState, onStatus, onLog, on
     pump();
   }
 
+  // Drops local "uploaded" records the server no longer has (e.g. deleted
+  // replays) so the next scan uploads those files again.
   async function reconcileWithServer() {
     const config = getConfig();
     const state = getState();
@@ -325,51 +369,35 @@ function createUploader({ getConfig, getState, persistState, onStatus, onLog, on
       return;
     }
 
-    // Entries recorded after this point may be missing from the list we are about
-    // to fetch, so they must not be treated as stale.
+    // Entries recorded after this point may not be visible to the check yet, so
+    // they must not be treated as stale.
     const startedAt = Date.now();
-    const listUrl = buildReplayListUrl(config.serverUrl, config.uploadPath);
-    const remoteKeys = new Set();
-    let cursor = null;
+    const candidates = Object.entries(state.uploaded)
+      .filter(([, info]) => {
+        const uploadedAt = Date.parse(info?.uploadedAt || "");
+        return !(Number.isFinite(uploadedAt) && uploadedAt >= startedAt);
+      })
+      .map(([hash]) => hash);
+    if (candidates.length === 0) {
+      return;
+    }
 
+    let existing;
     try {
-      do {
-        const response = await axios.get(listUrl, {
-          params: {
-            limit: 200,
-            ...(cursor ? { cursor } : {}),
-          },
-          headers: authHeaders(config),
-          timeout: 30000,
-        });
-
-        const items = Array.isArray(response?.data?.items) ? response.data.items : [];
-        for (const item of items) {
-          const name = item?.name;
-          const folder = item?.folder || "";
-          if (name) {
-            remoteKeys.add(`${folder}/${name}`);
-          }
-        }
-
-        cursor = response?.data?.next_cursor || null;
-      } while (cursor);
+      existing = await checkHashes(config, candidates);
     } catch (error) {
-      const message = error?.response?.data?.detail || error?.message || "failed to fetch replay list";
+      const message = error?.response?.data?.detail || error?.message || "hash check failed";
       onError(`State reconciliation skipped: ${message}`);
+      return;
+    }
+    if (existing === null) {
+      onLog("State reconciliation skipped: server does not support hash checks");
       return;
     }
 
     let removed = 0;
-    for (const [hash, uploadedInfo] of Object.entries(state.uploaded)) {
-      const uploadedAt = Date.parse(uploadedInfo?.uploadedAt || "");
-      if (Number.isFinite(uploadedAt) && uploadedAt >= startedAt) {
-        continue;
-      }
-      const remoteName = uploadedInfo?.remoteName || uploadedInfo?.fileName;
-      const remoteFolder = uploadedInfo?.remoteFolder || "";
-      const key = `${remoteFolder}/${remoteName}`;
-      if (!remoteName || !remoteKeys.has(key)) {
+    for (const hash of candidates) {
+      if (!existing.has(hash)) {
         delete state.uploaded[hash];
         removed += 1;
       }
@@ -397,7 +425,7 @@ function createUploader({ getConfig, getState, persistState, onStatus, onLog, on
 module.exports = {
   createUploader,
   buildUploadUrl,
-  buildReplayListUrl,
+  buildCheckUrl,
   sha256File,
   waitForStableSize,
 };
