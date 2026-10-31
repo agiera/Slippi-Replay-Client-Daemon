@@ -79,7 +79,10 @@ A `.slp` header stores the length of the game data, which Dolphin/Slippi
 Launcher leave at `0` while a game is being recorded and fill in when it ends.
 Files with a `0` length are streamed to `<upload path>/stream` as they grow;
 the stream ends once the header is filled in and the file stops growing, or
-after 10 minutes without new data. Live streams run independently of the
+after 10 minutes without new data. Idle time counts from the file's last write,
+so a game that was abandoned long ago (for example, Dolphin crashed) is sent
+straight away. If a stream is cut short, the server keeps what it received and
+replaces it once the complete file is uploaded. Live streams run independently of the
 upload queue, so they never delay other uploads.
 
 ## Logs

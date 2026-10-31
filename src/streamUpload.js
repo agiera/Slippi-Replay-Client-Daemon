@@ -60,7 +60,8 @@ class SlpTailStream extends Readable {
     this.idleTimeoutMs = idleTimeoutMs || STREAM_IDLE_TIMEOUT_MS;
     this.onLog = onLog || (() => {});
     this.offset = 0;
-    this.lastProgress = Date.now();
+    // Local time new bytes were last seen after the first read (0 until then).
+    this.lastProgress = 0;
     this.lastSize = -1;
     this.timer = null;
     this.reading = false;
@@ -118,7 +119,10 @@ class SlpTailStream extends Readable {
     if (size > this.offset) {
       const chunk = await this._readRange(this.offset, size);
       this.offset += chunk.length;
-      this.lastProgress = Date.now();
+      if (this.lastSize >= 0) {
+        // Growth while tailing: trust the local clock over the file's mtime.
+        this.lastProgress = Date.now();
+      }
       this.hash.update(chunk);
       this.bytesStreamed += chunk.length;
       backpressured = !this.push(chunk);
@@ -130,7 +134,11 @@ class SlpTailStream extends Readable {
       this._finish(null);
       return;
     }
-    if (Date.now() - this.lastProgress > this.idleTimeoutMs) {
+    // Idle time runs from the file's last write rather than from when this stream
+    // started, so a game abandoned long ago (e.g. Dolphin crashed) is finalized
+    // after one quiet poll instead of a full timeout.
+    const lastWriteMs = Math.max(this.lastProgress, stat.mtimeMs);
+    if (size === this.offset && size === this.lastSize && Date.now() - lastWriteMs > this.idleTimeoutMs) {
       this.onLog(`Live upload idle timeout reached for ${this.filePath}; finalizing`);
       this.reading = false;
       this._finish(null);
@@ -185,9 +193,10 @@ async function streamSlpUpload({ filePath, config, onLog }) {
   });
 
   const uploadUrl = buildStreamUrl(config.serverUrl, config.uploadPath);
-  let response;
+  let data;
+  let duplicate = false;
   try {
-    response = await axios.post(uploadUrl, tail, {
+    const response = await axios.post(uploadUrl, tail, {
       maxContentLength: Infinity,
       maxBodyLength: Infinity,
       headers: {
@@ -198,15 +207,28 @@ async function streamSlpUpload({ filePath, config, onLog }) {
       },
       timeout: 0,
     });
+    data = response?.data;
+  } catch (error) {
+    if (error?.response?.status !== 409) {
+      throw error;
+    }
+    // The server already stores these bytes; that is a successful outcome.
+    data = error.response.data;
+    duplicate = true;
   } finally {
     tail.destroy();
   }
 
   return {
     hash: tail.hash.digest("hex"),
+    // Hash of the bytes the server stored. It differs from both the streamed
+    // bytes and an unfinished file on disk, because the server fills in the
+    // header's length before storing.
+    serverHash: typeof data?.sha256 === "string" ? data.sha256 : null,
+    duplicate,
     sizeBytes: tail.bytesStreamed,
-    remoteName: response?.data?.name || path.basename(filePath),
-    remoteFolder: response?.data?.folder || null,
+    remoteName: data?.name || path.basename(filePath),
+    remoteFolder: data?.folder || null,
   };
 }
 

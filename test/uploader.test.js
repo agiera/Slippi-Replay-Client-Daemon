@@ -365,3 +365,42 @@ test("failed uploads are retried", async (t) => {
   assert.ok(events.statuses.includes("Upload failed (1/3): busy"));
   assert.match(events.errors[0], /Upload failed for .*retry\.slp \(1\/3\): busy/);
 });
+
+test("a live stream answered with 409 is recorded under the server's hash, not retried", async (t) => {
+  const file = path.join(makeTempDir(t), "Live409.slp");
+  fs.writeFileSync(file, partialSlpBytes());
+  const server = await startReplayServer(t, () => ({ status: 409, json: { detail: "Replay already uploaded", name: "kept.slp", sha256: H(9) } }));
+  const config = { serverUrl: server.url, uploadPath: "/up", apiToken: "tok", pollIntervalMs: 100 };
+  const { uploader, events, state } = makeUploader({ config });
+
+  uploader.enqueue(file);
+  setTimeout(() => finishSlp(file), 200);
+  await waitFor(() => events.statuses.includes("Already on server: Live409.slp"));
+
+  assert.equal(server.uploads.length, 1);
+  assert.equal(events.errors.length, 0);
+  assert.equal(state.uploaded[H(9)].remoteName, "kept.slp");
+  assert.equal(state.files[file].hash, H(9));
+});
+
+test("an abandoned game is streamed and finalized without waiting for the idle timeout", async (t) => {
+  const file = path.join(makeTempDir(t), "Crashed.slp");
+  fs.writeFileSync(file, partialSlpBytes());
+  const longAgo = new Date(Date.now() - 24 * 3600 * 1000);
+  fs.utimesSync(file, longAgo, longAgo);
+
+  const server = await startReplayServer(t, () => ({ json: { name: "Crashed.slp", sha256: H(4) } }));
+  const config = { serverUrl: server.url, uploadPath: "/up", apiToken: "tok", pollIntervalMs: 100 };
+  const { uploader, events, state } = makeUploader({ config });
+
+  const started = Date.now();
+  uploader.enqueue(file);
+  await waitFor(() => events.statuses.includes("Uploaded (live): Crashed.slp"), { timeoutMs: 3000 });
+  assert.ok(Date.now() - started < 2000);
+
+  assert.deepEqual(server.uploads[0].body, partialSlpBytes());
+  // The server patches the header before storing, so only its hash will match
+  // later startup checks; the unfinished file on disk hashes differently.
+  assert.equal(state.files[file].hash, H(4));
+  assert.ok(state.uploaded[H(4)]);
+});

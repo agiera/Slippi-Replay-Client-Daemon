@@ -244,9 +244,9 @@ function createUploader({ getConfig, getState, persistState, onStatus, onLog, on
 
     const result = await streamSlpUpload({ filePath, config, onLog });
 
-    // The game-end header patch means the file on disk no longer matches the bytes
-    // streamed; the server finalizes the stream the same way, so record the final
-    // file's hash so later scans and server checks match it.
+    // Record the hash the server stored so startup checks find it. Older servers
+    // don't return one; for a finished game the server's hash equals the
+    // finished file's, so fall back to hashing the file.
     let stat = null;
     let fileHash = null;
     try {
@@ -258,12 +258,17 @@ function createUploader({ getConfig, getState, persistState, onStatus, onLog, on
 
     recordUpload(state, {
       filePath,
-      hash: fileHash || result.hash,
+      hash: result.serverHash || fileHash || result.hash,
       stat: stat || { size: result.sizeBytes, mtimeMs: null },
       remoteName: result.remoteName,
       remoteFolder: result.remoteFolder,
     });
 
+    if (result.duplicate) {
+      onStatus(`Already on server: ${path.basename(filePath)}`);
+      onLog(`Server already had live game ${filePath}`);
+      return;
+    }
     onStatus(`Uploaded (live): ${path.basename(filePath)}`);
     onLog(`Live upload complete for ${filePath} (${result.sizeBytes} bytes)`);
   }
