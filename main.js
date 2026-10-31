@@ -2,11 +2,10 @@ const { app } = require("electron");
 const dotenv = require("dotenv");
 const path = require("path");
 
-const { loadConfig, saveConfig, mergeEnvOverrides, clampConcurrency } = require("./src/config");
+const { loadConfig, saveConfig, mergeEnvOverrides } = require("./src/config");
 const { loadState, saveState } = require("./src/state");
 const { createUploader } = require("./src/uploader");
 const { createWatcher } = require("./src/watcher");
-const { createRenderWorker } = require("./src/renderWorker");
 const { createTrayController } = require("./src/tray");
 const { createLogger } = require("./src/logger");
 
@@ -15,7 +14,6 @@ dotenv.config({ path: path.join(__dirname, ".env") });
 let trayController = null;
 let watcher = null;
 let uploader = null;
-let renderWorker = null;
 let config = null;
 let state = null;
 let logger = null;
@@ -52,17 +50,6 @@ async function syncNow() {
   watcher.scanNow();
 }
 
-function applyRenderWorkerState() {
-  if (!renderWorker) {
-    return;
-  }
-  if (config.renderEnabled) {
-    renderWorker.start();
-  } else {
-    renderWorker.stop();
-  }
-}
-
 app.whenReady().then(() => {
   config = mergeEnvOverrides(loadConfig(app));
   state = loadState(app);
@@ -79,13 +66,6 @@ app.whenReady().then(() => {
     getConfig: () => config,
     getState: () => state,
     persistState: () => saveState(app, state),
-    onStatus: (message) => trayController.setStatus(message),
-    onLog: (message) => logger.info(message),
-    onError: (message) => logger.error(message),
-  });
-
-  renderWorker = createRenderWorker({
-    getConfig: () => config,
     onStatus: (message) => trayController.setStatus(message),
     onLog: (message) => logger.info(message),
     onError: (message) => logger.error(message),
@@ -151,63 +131,6 @@ app.whenReady().then(() => {
       saveConfig(app, config);
       logger.info(`Open at login set to ${enabled}`);
     },
-    onToggleRender: (enabled) => {
-      config.renderEnabled = enabled;
-      saveConfig(app, config);
-      logger.info(`Render videos for server set to ${enabled}`);
-      applyRenderWorkerState();
-      trayController.setStatus(enabled ? "Rendering enabled" : "Rendering disabled");
-      trayController.refreshMenu();
-    },
-    onSetDolphinPath: async () => {
-      const nextPath = await trayController.pickFile({
-        title: "Choose Slippi Playback Dolphin",
-        defaultPath: config.dolphinPath,
-      });
-      if (!nextPath) {
-        return;
-      }
-      config.dolphinPath = nextPath;
-      saveConfig(app, config);
-      logger.info(`Playback Dolphin path updated to ${nextPath}`);
-      trayController.refreshMenu();
-    },
-    onSetMeleeIsoPath: async () => {
-      const nextPath = await trayController.pickFile({
-        title: "Choose Melee ISO",
-        defaultPath: config.meleeIsoPath,
-      });
-      if (!nextPath) {
-        return;
-      }
-      config.meleeIsoPath = nextPath;
-      saveConfig(app, config);
-      logger.info(`Melee ISO path updated to ${nextPath}`);
-      trayController.refreshMenu();
-    },
-    onSetFfmpegPath: async () => {
-      const nextPath = await trayController.pickFile({
-        title: "Choose ffmpeg executable",
-        defaultPath: config.ffmpegPath,
-      });
-      if (!nextPath) {
-        return;
-      }
-      config.ffmpegPath = nextPath;
-      saveConfig(app, config);
-      logger.info(`ffmpeg path updated to ${nextPath}`);
-      trayController.refreshMenu();
-    },
-    onSetRenderConcurrency: (value) => {
-      config.renderConcurrency = clampConcurrency(value);
-      saveConfig(app, config);
-      logger.info(`Max simultaneous renders set to ${config.renderConcurrency}`);
-      if (renderWorker) {
-        renderWorker.notifyConfigChanged();
-      }
-      trayController.setStatus(`Max renders: ${config.renderConcurrency}`);
-      trayController.refreshMenu();
-    },
   });
 
   trayController.setStatus("Starting...");
@@ -220,8 +143,6 @@ app.whenReady().then(() => {
     void syncNow();
   }
 
-  applyRenderWorkerState();
-
   trayController.refreshMenu();
 });
 
@@ -231,7 +152,4 @@ app.on("window-all-closed", (event) => {
 
 app.on("before-quit", () => {
   stopWatcher();
-  if (renderWorker) {
-    renderWorker.stop();
-  }
 });

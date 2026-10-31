@@ -17,11 +17,6 @@ function createTrayController({
   onSetApiToken,
   onSyncNow,
   onToggleAutostart,
-  onToggleRender,
-  onSetDolphinPath,
-  onSetMeleeIsoPath,
-  onSetFfmpegPath,
-  onSetRenderConcurrency,
 }) {
   const trayIcon = iconPath && fs.existsSync(iconPath) ? nativeImage.createFromPath(iconPath) : createDotIcon();
   const tray = new Tray(trayIcon);
@@ -40,20 +35,6 @@ function createTrayController({
       title: "Choose replay folder",
       defaultPath: defaultPath || undefined,
       properties: ["openDirectory", "createDirectory"],
-    });
-
-    if (result.canceled || result.filePaths.length === 0) {
-      return null;
-    }
-
-    return result.filePaths[0];
-  }
-
-  async function pickFile({ title, defaultPath }) {
-    const result = await dialog.showOpenDialog({
-      title: title || "Choose file",
-      defaultPath: defaultPath || undefined,
-      properties: ["openFile"],
     });
 
     if (result.canceled || result.filePaths.length === 0) {
@@ -169,37 +150,6 @@ function createTrayController({
       },
       { type: "separator" },
       {
-        label: "Render Videos For Server",
-        type: "checkbox",
-        checked: Boolean(config.renderEnabled),
-        click: (item) => onToggleRender(item.checked),
-      },
-      {
-        label: `Max Simultaneous Renders: ${config.renderConcurrency}`,
-        submenu: [1, 2, 3, 4, 5, 6, 8, 10].map((value) => ({
-          label: String(value),
-          type: "radio",
-          checked: Number(config.renderConcurrency) === value,
-          click: () => onSetRenderConcurrency(value),
-        })),
-      },
-      { label: `Dolphin: ${config.dolphinPath || "(not set)"}`, enabled: false },
-      {
-        label: "Set Playback Dolphin...",
-        click: () => onSetDolphinPath(),
-      },
-      { label: `Melee ISO: ${config.meleeIsoPath || "(not set)"}`, enabled: false },
-      {
-        label: "Set Melee ISO...",
-        click: () => onSetMeleeIsoPath(),
-      },
-      { label: `ffmpeg: ${config.ffmpegPath || "(not set)"}`, enabled: false },
-      {
-        label: "Set ffmpeg Path...",
-        click: () => onSetFfmpegPath(),
-      },
-      { type: "separator" },
-      {
         label: "Open Config Directory",
         click: () => {
           shell.openPath(app.getPath("userData"));
@@ -233,7 +183,6 @@ function createTrayController({
     setStatus,
     refreshMenu,
     pickWatchDirectory,
-    pickFile,
     promptForText,
   };
 }

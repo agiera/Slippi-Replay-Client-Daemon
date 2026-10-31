@@ -295,4 +295,7 @@ function createUploader({ getConfig, getState, persistState, onStatus, onLog, on
 
 module.exports = {
   createUploader,
+  buildUploadUrl,
+  buildReplayListUrl,
+  sha256File,
 };

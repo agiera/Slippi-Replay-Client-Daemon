@@ -91,4 +91,6 @@ function createWatcher({ watchDir, includeExtensions, pollIntervalMs, onCandidat
 
 module.exports = {
   createWatcher,
+  isReplayFile,
+  walkDir,
 };

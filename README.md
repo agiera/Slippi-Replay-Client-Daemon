@@ -9,7 +9,6 @@ Cross-platform Electron tray app that watches a local replay directory and uploa
 - Upload queue with retries
 - Deduplicates uploads by SHA-256 hash
 - Saves config and upload state under Electron user data
-- Opt-in video rendering: render server replays to mp4 locally and upload them back
 
 ## Configuration
 
@@ -31,6 +30,7 @@ Set at minimum:
 ```bash
 npm install
 npm start
+npm test   # runs the node:test suite in test/
 ```
 
 ## Build Packages
@@ -49,41 +49,9 @@ npm run build:mac
 - Set API token from a popup input
 - Choose watch folder
 - Sync immediately
-- Toggle "Render Videos For Server" (opt-in rendering)
-- Set Slippi Playback Dolphin, Melee ISO, and ffmpeg paths
 - Open app config directory
 - Open daemon log file
 - Toggle open-at-login
-
-## Video Rendering (Opt-In)
-
-When enabled, the daemon opens a WebSocket to the server
-(`/api/v1/renders/ws`) and waits for render jobs. For each job it:
-
-1. Downloads the replay the server points to.
-2. Renders it to mp4 locally with Slippi Playback Dolphin + ffmpeg.
-3. Uploads the mp4 back to `/api/v1/renders/jobs/{id}/result`.
-
-Requirements on the machine running the daemon:
-
-- A Slippi Playback build of Dolphin (`SLIPPI_REPLAY_DOLPHIN_PATH`)
-- A Melee 1.02 NTSC ISO (`SLIPPI_REPLAY_MELEE_ISO_PATH`)
-- `ffmpeg` on PATH or an explicit path (`SLIPPI_REPLAY_FFMPEG_PATH`)
-- On Linux, `xvfb-run` (Fedora: `xorg-x11-server-Xvfb`, Debian/Ubuntu:
-  `xvfb`) so Dolphin renders on an isolated virtual display. Desktop
-  compositors suspend a window's GL rendering when it's on an inactive
-  workspace, which starves the frame dump and stalls the render. If
-  `xvfb-run` is not found the daemon falls back to a normal windowed launch.
-
-Headless rendering is enabled by default on Linux. Toggle it with
-`SLIPPI_REPLAY_HEADLESS` (`true`/`false`); tune the virtual display with
-`SLIPPI_REPLAY_XVFB_SCREEN` (default `1920x1080x24`) or point at a specific
-wrapper with `SLIPPI_REPLAY_XVFB_RUN_PATH`.
-
-Enable it from the tray ("Render Videos For Server") or by setting
-`SLIPPI_REPLAY_RENDER_ENABLED=true`. The same API token used for uploads is
-used to authenticate the render WebSocket, so the token's user must have the
-`uploader` or `superuser` role.
 
 ## Logs
 

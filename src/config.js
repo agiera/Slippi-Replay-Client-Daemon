@@ -1,31 +1,5 @@
 const fs = require("fs");
-const os = require("os");
 const path = require("path");
-
-function defaultDolphinPath() {
-  if (process.platform === "win32") {
-    const appData = process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
-    return path.join(appData, "SlippiPlayback", "Slippi Dolphin.exe");
-  }
-  return path.join(os.homedir(), ".config", "Slippi Launcher", "playback", "Slippi_Playback-x86_64.AppImage");
-}
-
-const MAX_RENDER_CONCURRENCY = 64;
-
-function clampConcurrency(value) {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) {
-    return 5;
-  }
-  const rounded = Math.floor(parsed);
-  if (rounded < 1) {
-    return 1;
-  }
-  if (rounded > MAX_RENDER_CONCURRENCY) {
-    return MAX_RENDER_CONCURRENCY;
-  }
-  return rounded;
-}
 
 const DEFAULTS = {
   serverUrl: "http://localhost:8000",
@@ -35,17 +9,6 @@ const DEFAULTS = {
   includeExtensions: [".slp", ".zlp"],
   autoStart: true,
   pollIntervalMs: 2000,
-  renderEnabled: false,
-  renderConcurrency: 5,
-  dolphinPath: defaultDolphinPath(),
-  meleeIsoPath: "",
-  ffmpegPath: "ffmpeg",
-  // Run Dolphin on an isolated Xvfb display so the desktop compositor cannot
-  // suspend its GL rendering (and starve the frame dump) when it is on an
-  // inactive workspace. Requires xvfb-run (Fedora: xorg-x11-server-Xvfb).
-  headless: process.platform === "linux",
-  xvfbRunPath: "xvfb-run",
-  xvfbScreen: "1920x1080x24",
 };
 
 function getConfigPath(app) {
@@ -60,9 +23,6 @@ function normalizeConfig(config) {
       ? config.includeExtensions.map((ext) => ext.toLowerCase())
       : DEFAULTS.includeExtensions,
     pollIntervalMs: Number(config?.pollIntervalMs || DEFAULTS.pollIntervalMs),
-    renderEnabled: Boolean(config?.renderEnabled),
-    renderConcurrency: clampConcurrency(config?.renderConcurrency),
-    headless: config?.headless === undefined ? DEFAULTS.headless : Boolean(config.headless),
   };
 }
 
@@ -130,31 +90,6 @@ function mergeEnvOverrides(config) {
     merged.autoStart = process.env.SLIPPI_REPLAY_AUTO_START.toLowerCase() === "true";
   }
 
-  if (process.env.SLIPPI_REPLAY_RENDER_ENABLED) {
-    merged.renderEnabled = process.env.SLIPPI_REPLAY_RENDER_ENABLED.toLowerCase() === "true";
-  }
-  if (process.env.SLIPPI_REPLAY_RENDER_CONCURRENCY) {
-    merged.renderConcurrency = Number(process.env.SLIPPI_REPLAY_RENDER_CONCURRENCY);
-  }
-  if (process.env.SLIPPI_REPLAY_DOLPHIN_PATH) {
-    merged.dolphinPath = process.env.SLIPPI_REPLAY_DOLPHIN_PATH;
-  }
-  if (process.env.SLIPPI_REPLAY_MELEE_ISO_PATH) {
-    merged.meleeIsoPath = process.env.SLIPPI_REPLAY_MELEE_ISO_PATH;
-  }
-  if (process.env.SLIPPI_REPLAY_FFMPEG_PATH) {
-    merged.ffmpegPath = process.env.SLIPPI_REPLAY_FFMPEG_PATH;
-  }
-  if (process.env.SLIPPI_REPLAY_HEADLESS) {
-    merged.headless = process.env.SLIPPI_REPLAY_HEADLESS.toLowerCase() === "true";
-  }
-  if (process.env.SLIPPI_REPLAY_XVFB_RUN_PATH) {
-    merged.xvfbRunPath = process.env.SLIPPI_REPLAY_XVFB_RUN_PATH;
-  }
-  if (process.env.SLIPPI_REPLAY_XVFB_SCREEN) {
-    merged.xvfbScreen = process.env.SLIPPI_REPLAY_XVFB_SCREEN;
-  }
-
   return normalizeConfig(merged);
 }
 
@@ -162,6 +97,6 @@ module.exports = {
   loadConfig,
   saveConfig,
   mergeEnvOverrides,
-  clampConcurrency,
-  MAX_RENDER_CONCURRENCY,
+  normalizeConfig,
+  parseExtensionsFromEnv,
 };
