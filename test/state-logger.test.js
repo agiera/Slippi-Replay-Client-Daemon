@@ -65,3 +65,60 @@ test("logger rotates daemon.log once it exceeds the size limit", async (t) => {
   assert.doesNotMatch(current + rotated, /line 0 /, "oldest lines are dropped");
   assert.equal(fs.readdirSync(dir).sort().join(","), "daemon.log,daemon.log.1");
 });
+
+test("loadState repairs malformed fields and keeps unknown keys", (t) => {
+  const dir = makeTempDir(t);
+  const app = fakeApp(dir);
+  fs.writeFileSync(path.join(dir, "state.json"), JSON.stringify({ uploaded: null, files: 5, version: 2 }));
+  assert.deepEqual(loadState(app), { uploaded: {}, files: {}, version: 2 });
+
+  fs.writeFileSync(path.join(dir, "state.json"), "null");
+  assert.deepEqual(loadState(app), { uploaded: {}, files: {} });
+});
+
+test("saveState overwrites previous state", (t) => {
+  const app = fakeApp(makeTempDir(t));
+  saveState(app, { uploaded: { a: {} }, files: {} });
+  saveState(app, { uploaded: { b: {} }, files: {} });
+  assert.deepEqual(Object.keys(loadState(app).uploaded), ["b"]);
+});
+
+test("logger appends to an existing log across restarts", async (t) => {
+  const dir = makeTempDir(t);
+  t.mock.method(console, "log", () => {});
+
+  const first = createLogger(fakeApp(dir));
+  first.info("one");
+  await first.close();
+  const second = createLogger(fakeApp(dir));
+  second.info("two");
+  await second.close();
+
+  const lines = fs.readFileSync(second.logPath, "utf-8").trim().split("\n");
+  assert.equal(lines.length, 2);
+  assert.match(lines[0], /one$/);
+  assert.match(lines[1], /two$/);
+});
+
+test("logger rotates an oversized log left from a previous run on startup", async (t) => {
+  const dir = makeTempDir(t);
+  t.mock.method(console, "log", () => {});
+  fs.writeFileSync(path.join(dir, "daemon.log"), "old\n".repeat(100));
+
+  const logger = createLogger(fakeApp(dir), { maxBytes: 100 });
+  logger.info("fresh");
+  await logger.close();
+
+  assert.match(fs.readFileSync(logger.logPath, "utf-8"), /^\S+ \[INFO\] fresh\n$/);
+  assert.equal(fs.readFileSync(`${logger.logPath}.1`, "utf-8"), "old\n".repeat(100));
+});
+
+test("logger echoes lines to the console", async (t) => {
+  const dir = makeTempDir(t);
+  const consoleLog = t.mock.method(console, "log", () => {});
+  const logger = createLogger(fakeApp(dir));
+  logger.warn("visible");
+  await logger.close();
+  assert.equal(consoleLog.mock.callCount(), 1);
+  assert.match(consoleLog.mock.calls[0].arguments[0], /\[WARN\] visible$/);
+});

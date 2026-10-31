@@ -404,3 +404,231 @@ test("an abandoned game is streamed and finalized without waiting for the idle t
   assert.equal(state.files[file].hash, H(4));
   assert.ok(state.uploaded[H(4)]);
 });
+
+// Shortens the uploader's retry backoff (attempt * 2000ms) so retry tests run fast.
+// Writes a file with an old mtime so the uploader skips its stable-size wait.
+function writeSettled(file, contents) {
+  fs.writeFileSync(file, contents);
+  const old = new Date(Date.now() - 60000);
+  fs.utimesSync(file, old, old);
+}
+
+function fastRetries(t) {
+  const realSetTimeout = global.setTimeout;
+  t.mock.method(global, "setTimeout", (fn, ms, ...args) => realSetTimeout(fn, ms === 2000 || ms === 4000 ? 1 : ms, ...args));
+}
+
+test("uploads send bearer and token headers and fall back to the local name", async (t) => {
+  const file = path.join(makeTempDir(t), "Plain.slp");
+  writeSettled(file, completeSlpBytes());
+  const server = await startReplayServer(t, () => ({ json: {} }));
+  const config = { serverUrl: server.url, uploadPath: "/up", apiToken: "tok" };
+  const { uploader, events, state } = makeUploader({ config });
+
+  uploader.enqueue(file);
+  await waitFor(() => events.statuses.includes("Uploaded: Plain.slp"));
+
+  assert.equal(server.uploads[0].headers.authorization, "Bearer tok");
+  assert.equal(server.checks[0].headers.authorization, "Bearer tok");
+  const record = Object.values(state.uploaded)[0];
+  assert.equal(record.remoteName, "Plain.slp");
+  assert.equal(record.remoteFolder, null);
+  assert.equal(record.fileName, "Plain.slp");
+  assert.equal(record.filePath, file);
+  assert.ok(!Number.isNaN(Date.parse(record.uploadedAt)));
+});
+
+test("uploads give up after three failed attempts without recording state", async (t) => {
+  fastRetries(t);
+  const file = path.join(makeTempDir(t), "Broken.slp");
+  writeSettled(file, completeSlpBytes());
+  const server = await startReplayServer(t, () => ({ status: 500, json: { detail: "kaput" } }));
+  const config = { serverUrl: server.url, uploadPath: "/up", apiToken: "tok" };
+  const { uploader, events, state } = makeUploader({ config });
+
+  uploader.enqueue(file);
+  await waitFor(() => events.logs.some((l) => l.startsWith("Giving up on")));
+
+  assert.equal(server.uploads.length, 3);
+  assert.deepEqual(
+    events.statuses.filter((s) => s.startsWith("Upload failed")),
+    ["Upload failed (1/3): kaput", "Upload failed (2/3): kaput", "Upload failed (3/3): kaput"],
+  );
+  assert.deepEqual(state.uploaded, {});
+  assert.equal(events.persists, 0);
+
+  // Once given up, the file is no longer active and can be enqueued again.
+  uploader.enqueue(file);
+  await waitFor(() => events.logs.filter((l) => l.startsWith("Giving up on")).length === 2);
+  assert.equal(server.uploads.length, 6);
+});
+
+test("connection errors are reported with the transport message", async (t) => {
+  fastRetries(t);
+  const file = path.join(makeTempDir(t), "Offline.slp");
+  writeSettled(file, completeSlpBytes());
+  const config = { serverUrl: "http://127.0.0.1:1", uploadPath: "/up", apiToken: "tok" };
+  const { uploader, events } = makeUploader({ config });
+
+  uploader.enqueue(file);
+  await waitFor(() => events.logs.some((l) => l.startsWith("Giving up on")));
+
+  assert.ok(events.logs.some((l) => /^Hash check failed for .*Offline\.slp: /.test(l)));
+  assert.equal(events.errors.length, 3);
+  assert.match(events.errors[0], /ECONNREFUSED/);
+});
+
+test("a failing hash check is logged and the upload still happens", async (t) => {
+  const file = path.join(makeTempDir(t), "CheckDown.slp");
+  writeSettled(file, completeSlpBytes());
+  const server = await startReplayServer(t, () => ({ json: { name: "CheckDown.slp" } }), { checkStatus: 500 });
+  const config = { serverUrl: server.url, uploadPath: "/up", apiToken: "tok" };
+  const { uploader, events } = makeUploader({ config });
+
+  uploader.enqueue(file);
+  await waitFor(() => events.statuses.includes("Uploaded: CheckDown.slp"));
+
+  assert.equal(server.uploads.length, 1);
+  assert.ok(events.logs.some((l) => /^Hash check failed for .*CheckDown\.slp/.test(l)));
+  assert.equal(events.errors.length, 0);
+});
+
+test("identical content at a second path is indexed without re-uploading", async (t) => {
+  const dir = makeTempDir(t);
+  const first = path.join(dir, "a.slp");
+  const copy = path.join(dir, "copy.slp");
+  writeSettled(first, completeSlpBytes());
+  writeSettled(copy, completeSlpBytes());
+
+  const server = await startReplayServer(t, () => ({ json: { name: "a.slp" } }));
+  const config = { serverUrl: server.url, uploadPath: "/up", apiToken: "tok" };
+  const { uploader, events, state } = makeUploader({ config });
+
+  uploader.enqueue(first);
+  await waitFor(() => events.statuses.includes("Uploaded: a.slp"));
+  uploader.enqueue(copy);
+  await waitFor(() => events.statuses.includes("Already uploaded: copy.slp"));
+
+  assert.equal(server.uploads.length, 1);
+  assert.equal(state.files[copy].hash, state.files[first].hash);
+  assert.equal(Object.keys(state.uploaded).length, 1);
+});
+
+test("state from older versions without a files index is upgraded in place", async (t) => {
+  const file = path.join(makeTempDir(t), "Legacy.slp");
+  writeSettled(file, completeSlpBytes());
+  const server = await startReplayServer(t, () => ({ json: { name: "Legacy.slp" } }));
+  const config = { serverUrl: server.url, uploadPath: "/up", apiToken: "tok" };
+  const { uploader, events, state } = makeUploader({ config, state: { uploaded: {} } });
+
+  uploader.enqueue(file);
+  await waitFor(() => events.statuses.includes("Uploaded: Legacy.slp"));
+  assert.equal(typeof state.files[file].hash, "string");
+  assert.equal(state.files[file].size, completeSlpBytes().length);
+});
+
+test("non-.slp files are fully uploaded even if they look like live replays", async (t) => {
+  const file = path.join(makeTempDir(t), "Odd.zlp");
+  writeSettled(file, partialSlpBytes());
+  const server = await startReplayServer(t, () => ({ json: { name: "Odd.zlp" } }));
+  const config = { serverUrl: server.url, uploadPath: "/up", apiToken: "tok", pollIntervalMs: 100 };
+  const { uploader, events } = makeUploader({ config });
+
+  uploader.enqueue(file);
+  await waitFor(() => events.statuses.includes("Uploaded: Odd.zlp"));
+  assert.equal(server.uploads[0].url, "/up");
+  assert.match(server.uploads[0].headers["content-type"], /^multipart\/form-data/);
+});
+
+test("directories are ignored without uploading or reporting", async (t) => {
+  const dir = path.join(makeTempDir(t), "folder.slp");
+  fs.mkdirSync(dir);
+  const old = new Date(Date.now() - 60000);
+  fs.utimesSync(dir, old, old);
+  const server = await startReplayServer(t);
+  const config = { serverUrl: server.url, uploadPath: "/up", apiToken: "tok" };
+  const { uploader, events } = makeUploader({ config });
+
+  uploader.enqueue(dir);
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(server.uploads.length + server.checks.length, 0);
+  assert.deepEqual(events.statuses, []);
+  assert.deepEqual(events.errors, []);
+});
+
+test("a failed live stream is retried", async (t) => {
+  fastRetries(t);
+  const file = path.join(makeTempDir(t), "Flaky.slp");
+  fs.writeFileSync(file, partialSlpBytes());
+  // An abandoned game finalizes after one quiet poll instead of the idle timeout.
+  const longAgo = new Date(Date.now() - 24 * 3600 * 1000);
+  fs.utimesSync(file, longAgo, longAgo);
+
+  let calls = 0;
+  const server = await startReplayServer(t, () => {
+    calls += 1;
+    return calls === 1 ? { status: 502, json: { detail: "bad gateway" } } : { json: { name: "Flaky.slp", sha256: H(5) } };
+  });
+  const config = { serverUrl: server.url, uploadPath: "/up", apiToken: "tok", pollIntervalMs: 100 };
+  const { uploader, events, state } = makeUploader({ config });
+
+  uploader.enqueue(file);
+  await waitFor(() => events.statuses.includes("Uploaded (live): Flaky.slp"));
+
+  assert.equal(server.uploads.length, 2);
+  assert.ok(server.uploads.every((r) => r.url === "/up/stream"));
+  assert.ok(events.statuses.includes("Upload failed (1/3): bad gateway"));
+  assert.ok(state.uploaded[H(5)]);
+});
+
+test("many queued files are all uploaded", async (t) => {
+  const dir = makeTempDir(t);
+  const files = [];
+  for (let i = 0; i < 6; i += 1) {
+    const file = path.join(dir, `G${i}.slp`);
+    writeSettled(file, Buffer.concat([completeSlpBytes(), Buffer.from(String(i))]));
+    files.push(file);
+  }
+  const server = await startReplayServer(t, () => ({ json: {} }));
+  const config = { serverUrl: server.url, uploadPath: "/up", apiToken: "tok" };
+  const { uploader, events, state } = makeUploader({ config });
+
+  files.forEach((f) => uploader.enqueue(f));
+  await waitFor(() => events.statuses.filter((s) => s.startsWith("Uploaded: ")).length === 6);
+
+  assert.equal(server.uploads.length, 6);
+  assert.equal(Object.keys(state.uploaded).length, 6);
+  assert.deepEqual(Object.keys(state.files).sort(), files.sort());
+});
+
+test("reconcileWithServer makes no request when nothing has been uploaded", async (t) => {
+  const server = await startReplayServer(t);
+  const config = { serverUrl: server.url, uploadPath: "/up", apiToken: "tok" };
+  const { uploader, events } = makeUploader({ config });
+  await uploader.reconcileWithServer();
+  assert.equal(server.checks.length, 0);
+  assert.equal(events.persists, 0);
+});
+
+test("reconcileWithServer does not persist when every entry still exists", async (t) => {
+  const server = await startReplayServer(t, null, { existing: { [H(1)]: { name: "a.slp" } } });
+  const state = { uploaded: { [H(1)]: {} }, files: { "/r/a.slp": { hash: H(1) } } };
+  const config = { serverUrl: server.url, uploadPath: "/up", apiToken: "tok" };
+  const { uploader, events } = makeUploader({ config, state });
+
+  await uploader.reconcileWithServer();
+  assert.equal(server.checks.length, 1);
+  assert.equal(events.persists, 0);
+  assert.deepEqual(events.statuses, []);
+  assert.deepEqual(Object.keys(state.files), ["/r/a.slp"]);
+});
+
+test("waitForStableSize waits for a file that is still growing", async (t) => {
+  const file = path.join(makeTempDir(t), "growing.slp");
+  fs.writeFileSync(file, "a");
+  const grow = setTimeout(() => fs.appendFileSync(file, "bcd"), 200);
+  t.after(() => clearTimeout(grow));
+
+  const stat = await waitForStableSize(file);
+  assert.equal(stat.size, 4);
+});

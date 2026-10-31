@@ -93,3 +93,76 @@ test("start can use polling for network filesystems", async (t) => {
   fs.writeFileSync(replay, "x");
   await waitFor(() => events.candidates.includes(replay));
 });
+
+test("scanNow reports a missing directory when none is configured", async () => {
+  const { watcher, events } = makeWatcher({ watchDir: "" });
+  await watcher.scanNow();
+  assert.deepEqual(events.statuses, ["Watch directory not found"]);
+  assert.deepEqual(events.candidates, []);
+});
+
+test("scanNow honors every configured extension and logs completion", async (t) => {
+  const dir = makeTempDir(t);
+  for (const name of ["a.slp", "b.zlp", "c.mp4"]) fs.writeFileSync(path.join(dir, name), "");
+  const { watcher, events } = makeWatcher({ watchDir: dir, includeExtensions: [".slp", ".zlp"] });
+  await watcher.scanNow();
+  assert.deepEqual(events.candidates.map((f) => path.basename(f)).sort(), ["a.slp", "b.zlp"]);
+  assert.deepEqual(events.logs, [`Completed scan for ${dir}`]);
+});
+
+test("start ignores files that existed before watching", async (t) => {
+  const dir = makeTempDir(t);
+  fs.writeFileSync(path.join(dir, "existing.slp"), "x");
+  const { watcher, events } = makeWatcher({ watchDir: dir });
+  watcher.start();
+  t.after(() => watcher.stop());
+
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const fresh = path.join(dir, "fresh.slp");
+  fs.writeFileSync(fresh, "x");
+  await waitFor(() => events.candidates.includes(fresh));
+  assert.ok(!events.candidates.some((f) => f.endsWith("existing.slp")));
+});
+
+test("start reports changes to replay files being written", async (t) => {
+  const dir = makeTempDir(t);
+  const replay = path.join(dir, "live.slp");
+  fs.writeFileSync(replay, "x");
+  const { watcher, events } = makeWatcher({ watchDir: dir });
+  watcher.start();
+  t.after(() => watcher.stop());
+
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  fs.appendFileSync(replay, "more");
+  await waitFor(() => events.candidates.includes(replay));
+});
+
+test("start detects replays in subdirectories", async (t) => {
+  const dir = makeTempDir(t);
+  fs.mkdirSync(path.join(dir, "2026-10"));
+  const { watcher, events } = makeWatcher({ watchDir: dir });
+  watcher.start();
+  t.after(() => watcher.stop());
+
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const nested = path.join(dir, "2026-10", "Game.slp");
+  fs.writeFileSync(nested, "x");
+  await waitFor(() => events.candidates.includes(nested));
+});
+
+test("stop halts events and is safe to call repeatedly", async (t) => {
+  const dir = makeTempDir(t);
+  const { watcher, events } = makeWatcher({ watchDir: dir });
+  watcher.stop();
+  assert.deepEqual(events.logs, [], "stopping an unstarted watcher logs nothing");
+
+  watcher.start();
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  watcher.stop();
+  watcher.stop();
+  assert.equal(events.logs.filter((l) => l === "Watcher stopped").length, 1);
+
+  fs.writeFileSync(path.join(dir, "after.slp"), "x");
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  assert.deepEqual(events.candidates, []);
+});

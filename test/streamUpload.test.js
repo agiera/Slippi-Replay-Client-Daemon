@@ -103,3 +103,96 @@ test("streamSlpUpload finalizes with what it has when the file disappears", asyn
   assert.equal(result.remoteName, "vanish.slp");
   assert.equal(result.remoteFolder, null);
 });
+
+test("streamSlpUpload treats a 409 as a duplicate and returns the server's hash", async (t) => {
+  const file = path.join(makeTempDir(t), "dup.slp");
+  fs.writeFileSync(file, completeSlpBytes());
+  const serverHash = "a".repeat(64);
+  const server = await startServer(t, () => ({ status: 409, json: { detail: "exists", name: "kept.slp", folder: "x", sha256: serverHash } }));
+
+  const result = await streamSlpUpload({
+    filePath: file,
+    config: { serverUrl: server.url, uploadPath: "/up", apiToken: "tok", pollIntervalMs: 100 },
+  });
+
+  assert.equal(result.duplicate, true);
+  assert.equal(result.serverHash, serverHash);
+  assert.equal(result.remoteName, "kept.slp");
+  assert.equal(result.remoteFolder, "x");
+});
+
+test("streamSlpUpload ignores a non-string server hash", async (t) => {
+  const file = path.join(makeTempDir(t), "odd.slp");
+  fs.writeFileSync(file, completeSlpBytes());
+  const server = await startServer(t, () => ({ json: { sha256: 123 } }));
+
+  const result = await streamSlpUpload({
+    filePath: file,
+    config: { serverUrl: server.url, uploadPath: "/up", apiToken: "tok", pollIntervalMs: 100 },
+  });
+
+  assert.equal(result.serverHash, null);
+  assert.equal(result.duplicate, false);
+  assert.equal(result.remoteName, "odd.slp");
+});
+
+test("streamSlpUpload ends promptly for an already finished file", async (t) => {
+  const file = path.join(makeTempDir(t), "done.slp");
+  fs.writeFileSync(file, completeSlpBytes());
+  const server = await startServer(t);
+
+  const started = Date.now();
+  const result = await streamSlpUpload({
+    filePath: file,
+    config: { serverUrl: server.url, uploadPath: "/up", apiToken: "tok", pollIntervalMs: 100 },
+  });
+
+  assert.ok(Date.now() - started < 2000);
+  assert.deepEqual(server.requests[0].body, completeSlpBytes());
+  assert.equal(result.hash, crypto.createHash("sha256").update(completeSlpBytes()).digest("hex"));
+});
+
+test("streamSlpUpload rethrows server errors other than 409", async (t) => {
+  const file = path.join(makeTempDir(t), "err.slp");
+  fs.writeFileSync(file, completeSlpBytes());
+  const server = await startServer(t, () => ({ status: 401, json: { detail: "bad token" } }));
+
+  await assert.rejects(
+    streamSlpUpload({ filePath: file, config: { serverUrl: server.url, uploadPath: "/up", apiToken: "nope", pollIntervalMs: 100 } }),
+    (error) => error.response.status === 401 && error.response.data.detail === "bad token",
+  );
+});
+
+test("streamSlpUpload finalizes an abandoned game and logs the idle timeout", async (t) => {
+  const file = path.join(makeTempDir(t), "stale.slp");
+  fs.writeFileSync(file, partialSlpBytes());
+  const longAgo = new Date(Date.now() - 24 * 3600 * 1000);
+  fs.utimesSync(file, longAgo, longAgo);
+  const server = await startServer(t);
+  const logs = [];
+
+  await streamSlpUpload({
+    filePath: file,
+    config: { serverUrl: server.url, uploadPath: "/up", apiToken: "tok", pollIntervalMs: 100 },
+    onLog: (l) => logs.push(l),
+  });
+
+  assert.deepEqual(server.requests[0].body, partialSlpBytes());
+  assert.ok(logs.some((l) => /idle timeout reached for .*stale\.slp/.test(l)));
+});
+
+test("streamSlpUpload streams large files intact under backpressure", async (t) => {
+  const file = path.join(makeTempDir(t), "big.slp");
+  const payload = crypto.randomBytes(4 * 1024 * 1024);
+  const contents = Buffer.concat([completeSlpBytes().subarray(0, 15), payload, Buffer.from("metadata{}}", "latin1")]);
+  fs.writeFileSync(file, contents);
+  const server = await startServer(t);
+
+  const result = await streamSlpUpload({
+    filePath: file,
+    config: { serverUrl: server.url, uploadPath: "/up", apiToken: "tok", pollIntervalMs: 100 },
+  });
+
+  assert.equal(result.sizeBytes, contents.length);
+  assert.ok(server.requests[0].body.equals(contents));
+});
