@@ -13,21 +13,23 @@ test("loadState returns a fresh initial state when missing or corrupt", (t) => {
 
   const a = loadState(app);
   const b = loadState(app);
-  assert.deepEqual(a, { uploaded: {} });
+  assert.deepEqual(a, { uploaded: {}, files: {} });
   a.uploaded.x = 1;
   assert.deepEqual(b.uploaded, {}, "initial state must not be shared");
 
   fs.writeFileSync(path.join(dir, "state.json"), "garbage");
-  assert.deepEqual(loadState(app), { uploaded: {} });
+  assert.deepEqual(loadState(app), { uploaded: {}, files: {} });
 });
 
 test("saveState and loadState round-trip", (t) => {
   const app = fakeApp(path.join(makeTempDir(t), "sub"));
   saveState(app, { uploaded: { abc: { fileName: "a.slp" } } });
   assert.deepEqual(loadState(app).uploaded, { abc: { fileName: "a.slp" } });
+  assert.deepEqual(loadState(app).files, {}, "older state files gain an empty index");
+  assert.deepEqual(fs.readdirSync(path.dirname(path.join(app.getPath("userData"), "state.json"))), ["state.json"], "no temp files left behind");
 });
 
-test("logger appends leveled lines to daemon.log", (t) => {
+test("logger appends leveled lines to daemon.log", async (t) => {
   const dir = makeTempDir(t);
   t.mock.method(console, "log", () => {});
 
@@ -35,6 +37,7 @@ test("logger appends leveled lines to daemon.log", (t) => {
   logger.info("hello");
   logger.warn("careful");
   logger.error("boom");
+  await logger.close();
 
   assert.equal(logger.logPath, path.join(dir, "daemon.log"));
   const lines = fs.readFileSync(logger.logPath, "utf-8").trim().split("\n");
@@ -42,4 +45,23 @@ test("logger appends leveled lines to daemon.log", (t) => {
   assert.match(lines[0], /^\d{4}-\d{2}-\d{2}T.* \[INFO\] hello$/);
   assert.match(lines[1], /\[WARN\] careful$/);
   assert.match(lines[2], /\[ERROR\] boom$/);
+});
+
+test("logger rotates daemon.log once it exceeds the size limit", async (t) => {
+  const dir = makeTempDir(t);
+  t.mock.method(console, "log", () => {});
+
+  const logger = createLogger(fakeApp(dir), { maxBytes: 200 });
+  for (let i = 0; i < 20; i += 1) {
+    logger.info(`line ${i} ${"x".repeat(20)}`);
+  }
+  await logger.close();
+
+  const current = fs.readFileSync(logger.logPath, "utf-8");
+  const rotated = fs.readFileSync(`${logger.logPath}.1`, "utf-8");
+  assert.ok(Buffer.byteLength(current) <= 200);
+  assert.ok(rotated.length > 0);
+  assert.match(current + rotated, /line 19 /, "newest line is kept");
+  assert.doesNotMatch(current + rotated, /line 0 /, "oldest lines are dropped");
+  assert.equal(fs.readdirSync(dir).sort().join(","), "daemon.log,daemon.log.1");
 });

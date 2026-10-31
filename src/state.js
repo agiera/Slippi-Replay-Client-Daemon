@@ -1,9 +1,13 @@
 const fs = require("fs");
 const path = require("path");
+const { writeFileAtomic } = require("./fsUtil");
 
-const INITIAL_STATE = {
-  uploaded: {},
-};
+// uploaded: content hash -> upload record
+// files: local path -> { size, mtimeMs, hash }, used to skip unchanged files
+// without re-reading them on every scan.
+function initialState() {
+  return { uploaded: {}, files: {} };
+}
 
 function getStatePath(app) {
   return path.join(app.getPath("userData"), "state.json");
@@ -12,23 +16,24 @@ function getStatePath(app) {
 function loadState(app) {
   const statePath = getStatePath(app);
   if (!fs.existsSync(statePath)) {
-    return structuredClone(INITIAL_STATE);
+    return initialState();
   }
 
   try {
+    const parsed = JSON.parse(fs.readFileSync(statePath, "utf-8"));
     return {
-      ...INITIAL_STATE,
-      ...JSON.parse(fs.readFileSync(statePath, "utf-8")),
+      ...initialState(),
+      ...parsed,
+      uploaded: parsed?.uploaded && typeof parsed.uploaded === "object" ? parsed.uploaded : {},
+      files: parsed?.files && typeof parsed.files === "object" ? parsed.files : {},
     };
   } catch {
-    return structuredClone(INITIAL_STATE);
+    return initialState();
   }
 }
 
 function saveState(app, state) {
-  const statePath = getStatePath(app);
-  fs.mkdirSync(path.dirname(statePath), { recursive: true });
-  fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+  writeFileAtomic(getStatePath(app), JSON.stringify(state, null, 2));
 }
 
 module.exports = {

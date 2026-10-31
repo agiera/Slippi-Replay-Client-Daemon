@@ -1,5 +1,16 @@
 const { Tray, Menu, dialog, nativeImage, shell, BrowserWindow, ipcMain } = require("electron");
 const fs = require("fs");
+const path = require("path");
+const { isAutoStartEnabled } = require("./autostart");
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
 
 function createDotIcon() {
   const dataUrl =
@@ -45,10 +56,6 @@ function createTrayController({
   }
 
   async function promptForText({ title, label, defaultValue = "", isSecret = false }) {
-    const channelBase = `prompt-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    const submitChannel = `${channelBase}-submit`;
-    const cancelChannel = `${channelBase}-cancel`;
-
     return new Promise((resolve) => {
       const promptWindow = new BrowserWindow({
         width: 420,
@@ -60,65 +67,69 @@ function createTrayController({
         autoHideMenuBar: true,
         alwaysOnTop: true,
         webPreferences: {
-          nodeIntegration: true,
-          contextIsolation: false,
+          preload: path.join(__dirname, "promptPreload.js"),
+          contextIsolation: true,
+          nodeIntegration: false,
+          sandbox: true,
         },
       });
-
-      const escapedTitle = title.replace(/"/g, "&quot;");
-      const escapedLabel = label.replace(/"/g, "&quot;");
-      const escapedDefaultValue = defaultValue.replace(/"/g, "&quot;");
+      const { webContents } = promptWindow;
 
       const html = `<!DOCTYPE html>
 <html>
+  <head>
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'" />
+  </head>
   <body style="font-family: Arial, sans-serif; padding: 14px; background: #12101d; color: #f5f4ff;">
-    <h3 style="margin: 0 0 10px 0;">${escapedTitle}</h3>
-    <label style="display:block; margin-bottom: 8px;">${escapedLabel}</label>
-    <input id="value" type="${isSecret ? "password" : "text"}" value="${escapedDefaultValue}" style="width:100%; padding:8px; box-sizing:border-box; margin-bottom:10px;" />
+    <h3 style="margin: 0 0 10px 0;">${escapeHtml(title)}</h3>
+    <label style="display:block; margin-bottom: 8px;">${escapeHtml(label)}</label>
+    <input id="value" type="${isSecret ? "password" : "text"}" value="${escapeHtml(defaultValue)}" style="width:100%; padding:8px; box-sizing:border-box; margin-bottom:10px;" />
     <div style="display:flex; justify-content:flex-end; gap:8px;">
       <button id="cancel">Cancel</button>
       <button id="ok">Save</button>
     </div>
     <script>
-      const { ipcRenderer } = require('electron');
       const input = document.getElementById('value');
       input.focus();
       input.select();
-      document.getElementById('ok').addEventListener('click', () => ipcRenderer.send('${submitChannel}', input.value));
-      document.getElementById('cancel').addEventListener('click', () => ipcRenderer.send('${cancelChannel}'));
+      document.getElementById('ok').addEventListener('click', () => window.promptApi.submit(input.value));
+      document.getElementById('cancel').addEventListener('click', () => window.promptApi.cancel());
       input.addEventListener('keydown', (event) => {
-        if (event.key === 'Enter') ipcRenderer.send('${submitChannel}', input.value);
-        if (event.key === 'Escape') ipcRenderer.send('${cancelChannel}');
+        if (event.key === 'Enter') window.promptApi.submit(input.value);
+        if (event.key === 'Escape') window.promptApi.cancel();
       });
     </script>
   </body>
 </html>`;
 
-      const cleanup = () => {
-        ipcMain.removeAllListeners(submitChannel);
-        ipcMain.removeAllListeners(cancelChannel);
+      let settled = false;
+      const finish = (value) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        ipcMain.removeListener("prompt:submit", onSubmit);
+        ipcMain.removeListener("prompt:cancel", onCancel);
+        if (!promptWindow.isDestroyed()) {
+          promptWindow.close();
+        }
+        resolve(value);
+      };
+      // Channels are shared, so only accept messages from this prompt's window.
+      const onSubmit = (event, value) => {
+        if (event.sender === webContents) {
+          finish(String(value || "").trim());
+        }
+      };
+      const onCancel = (event) => {
+        if (event.sender === webContents) {
+          finish(null);
+        }
       };
 
-      ipcMain.once(submitChannel, (_event, value) => {
-        cleanup();
-        if (!promptWindow.isDestroyed()) {
-          promptWindow.close();
-        }
-        resolve((value || "").trim());
-      });
-
-      ipcMain.once(cancelChannel, () => {
-        cleanup();
-        if (!promptWindow.isDestroyed()) {
-          promptWindow.close();
-        }
-        resolve(null);
-      });
-
-      promptWindow.on("closed", () => {
-        cleanup();
-        resolve(null);
-      });
+      ipcMain.on("prompt:submit", onSubmit);
+      ipcMain.on("prompt:cancel", onCancel);
+      promptWindow.on("closed", () => finish(null));
 
       promptWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
     });
@@ -164,7 +175,7 @@ function createTrayController({
       {
         label: "Open At Login",
         type: "checkbox",
-        checked: app.getLoginItemSettings().openAtLogin,
+        checked: isAutoStartEnabled(app),
         click: (item) => onToggleAutostart(item.checked),
       },
       { type: "separator" },
@@ -189,4 +200,5 @@ function createTrayController({
 
 module.exports = {
   createTrayController,
+  escapeHtml,
 };

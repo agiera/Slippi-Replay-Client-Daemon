@@ -4,8 +4,8 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const { createUploader, buildUploadUrl, buildReplayListUrl, sha256File } = require("../src/uploader");
-const { makeTempDir, startServer, waitFor, completeSlpBytes, partialSlpBytes } = require("./helpers");
+const { createUploader, buildUploadUrl, buildReplayListUrl, sha256File, waitForStableSize } = require("../src/uploader");
+const { makeTempDir, startServer, waitFor, completeSlpBytes, partialSlpBytes, finishSlp } = require("./helpers");
 
 test("buildUploadUrl joins server and path", () => {
   assert.equal(buildUploadUrl("http://h/", "/api/up"), "http://h/api/up");
@@ -109,9 +109,7 @@ test("enqueue skips files that no longer exist", async (t) => {
 
 test("enqueue live-streams an incomplete .slp and dedupes repeated enqueues", async (t) => {
   const file = path.join(makeTempDir(t), "Live.slp");
-  const part1 = partialSlpBytes();
-  const part2 = completeSlpBytes();
-  fs.writeFileSync(file, part1);
+  fs.writeFileSync(file, partialSlpBytes());
 
   const server = await startServer(t, () => ({ json: { name: "Live.slp", folder: "live" } }));
   const config = { serverUrl: server.url, uploadPath: "/api/v1/uploads/files", apiToken: "tok", pollIntervalMs: 100 };
@@ -122,18 +120,99 @@ test("enqueue live-streams an incomplete .slp and dedupes repeated enqueues", as
   uploader.enqueue(file);
   await new Promise((r) => setTimeout(r, 300));
   uploader.enqueue(file);
-  fs.appendFileSync(file, part2);
+  finishSlp(file);
 
   await waitFor(() => events.statuses.includes("Uploaded (live): Live.slp"));
 
   assert.equal(server.requests.length, 1);
   assert.equal(server.requests[0].url, "/api/v1/uploads/files/stream");
-  const expected = Buffer.concat([part1, part2]);
-  assert.deepEqual(server.requests[0].body, expected);
+  const final = fs.readFileSync(file);
+  assert.deepEqual(server.requests[0].body.subarray(15), final.subarray(15));
 
-  const hash = crypto.createHash("sha256").update(expected).digest("hex");
+  // The finished file's hash is recorded so later scans dedupe it.
+  const hash = crypto.createHash("sha256").update(final).digest("hex");
   assert.equal(state.uploaded[hash].remoteFolder, "live");
-  assert.equal(state.uploaded[hash].sizeBytes, expected.length);
+  assert.equal(state.uploaded[hash].sizeBytes, final.length);
+  assert.equal(state.files[file].hash, hash);
+
+  // The game-end `change` event must not trigger a second upload.
+  uploader.enqueue(file);
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(server.requests.length, 1);
+});
+
+test("a live stream does not block uploads of other files", async (t) => {
+  const dir = makeTempDir(t);
+  const live = path.join(dir, "Live.slp");
+  const done = path.join(dir, "Done.slp");
+  fs.writeFileSync(live, partialSlpBytes());
+  fs.writeFileSync(done, completeSlpBytes());
+
+  const server = await startServer(t, (req) => ({ json: { name: req.url.endsWith("/stream") ? "Live.slp" : "Done.slp" } }));
+  const config = { serverUrl: server.url, uploadPath: "/up", apiToken: "tok", pollIntervalMs: 100 };
+  const { uploader, events } = makeUploader({ config });
+
+  uploader.enqueue(live);
+  await new Promise((r) => setTimeout(r, 100));
+  uploader.enqueue(done);
+
+  await waitFor(() => events.statuses.includes("Uploaded: Done.slp"));
+  assert.ok(!events.statuses.includes("Uploaded (live): Live.slp"), "live stream should still be running");
+
+  finishSlp(live);
+  await waitFor(() => events.statuses.includes("Uploaded (live): Live.slp"));
+});
+
+test("unchanged files are skipped without re-reading; modified files are re-uploaded", async (t) => {
+  const file = path.join(makeTempDir(t), "Game.slp");
+  fs.writeFileSync(file, completeSlpBytes());
+
+  const server = await startServer(t, () => ({ json: { name: "Game.slp" } }));
+  const config = { serverUrl: server.url, uploadPath: "/up", apiToken: "tok" };
+  const { uploader, events } = makeUploader({ config });
+
+  uploader.enqueue(file);
+  await waitFor(() => events.statuses.includes("Uploaded: Game.slp"));
+  assert.equal(server.requests[0].headers["x-content-sha256"], crypto.createHash("sha256").update(completeSlpBytes()).digest("hex"));
+
+  const statusCount = events.statuses.length;
+  uploader.enqueue(file);
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(server.requests.length, 1);
+  assert.equal(events.statuses.length, statusCount, "index hit should not hash or report");
+
+  fs.appendFileSync(file, "x");
+  uploader.enqueue(file);
+  await waitFor(() => server.requests.length === 2);
+});
+
+test("a 409 from the server is recorded as already uploaded", async (t) => {
+  const file = path.join(makeTempDir(t), "Dup.slp");
+  fs.writeFileSync(file, completeSlpBytes());
+
+  const server = await startServer(t, () => ({ status: 409, json: { detail: "exists", name: "Dup.slp", folder: "x" } }));
+  const config = { serverUrl: server.url, uploadPath: "/up", apiToken: "tok" };
+  const { uploader, events, state } = makeUploader({ config });
+
+  uploader.enqueue(file);
+  await waitFor(() => events.statuses.includes("Uploaded: Dup.slp"));
+  assert.equal(server.requests.length, 1);
+  const hash = crypto.createHash("sha256").update(completeSlpBytes()).digest("hex");
+  assert.equal(state.uploaded[hash].remoteFolder, "x");
+  assert.equal(events.errors.length, 0);
+});
+
+test("waitForStableSize returns immediately for settled files", async (t) => {
+  const file = path.join(makeTempDir(t), "old.slp");
+  fs.writeFileSync(file, "x");
+  const old = new Date(Date.now() - 60000);
+  fs.utimesSync(file, old, old);
+
+  const started = Date.now();
+  const stat = await waitForStableSize(file);
+  assert.ok(Date.now() - started < 100);
+  assert.equal(stat.size, 1);
+  assert.equal(await waitForStableSize(path.join(path.dirname(file), "missing")), null);
 });
 
 test("reconcileWithServer removes entries missing on the server across pages", async (t) => {
@@ -178,6 +257,27 @@ test("reconcileWithServer keeps state intact when the server errors", async (t) 
   assert.deepEqual(Object.keys(state.uploaded), ["h1"]);
   assert.equal(events.persists, 0);
   assert.deepEqual(events.errors, ["State reconciliation skipped: db down"]);
+});
+
+test("reconcileWithServer keeps entries recorded during the fetch and prunes the file index", async (t) => {
+  const server = await startServer(t, () => ({ json: { items: [], next_cursor: null } }));
+  const state = {
+    uploaded: {
+      old: { remoteName: "old.slp", uploadedAt: new Date(Date.now() - 60000).toISOString() },
+      fresh: { remoteName: "fresh.slp", uploadedAt: new Date(Date.now() + 60000).toISOString() },
+    },
+    files: {
+      "/r/old.slp": { size: 1, mtimeMs: 1, hash: "old" },
+      "/r/fresh.slp": { size: 1, mtimeMs: 1, hash: "fresh" },
+    },
+  };
+  const config = { serverUrl: server.url, uploadPath: "/api/v1/uploads/files", apiToken: "tok" };
+  const { uploader } = makeUploader({ config, state });
+
+  await uploader.reconcileWithServer();
+
+  assert.deepEqual(Object.keys(state.uploaded), ["fresh"]);
+  assert.deepEqual(Object.keys(state.files), ["/r/fresh.slp"]);
 });
 
 test("reconcileWithServer does nothing without credentials", async () => {

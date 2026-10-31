@@ -4,20 +4,15 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const {
-  SLP_METADATA_MARKER,
-  buildStreamUrl,
-  isSlpFileComplete,
-  streamSlpUpload,
-} = require("../src/streamUpload");
-const { makeTempDir, startServer, completeSlpBytes, partialSlpBytes } = require("./helpers");
+const { buildStreamUrl, readSlpRawLength, isSlpFileComplete, streamSlpUpload } = require("../src/streamUpload");
+const { makeTempDir, startServer, completeSlpBytes, partialSlpBytes, finishSlp } = require("./helpers");
 
 test("buildStreamUrl normalizes slashes", () => {
   assert.equal(buildStreamUrl("http://h/", "/api/up/"), "http://h/api/up/stream");
   assert.equal(buildStreamUrl("http://h", "api/up"), "http://h/api/up/stream");
 });
 
-test("isSlpFileComplete detects the metadata marker", async (t) => {
+test("isSlpFileComplete reads the header raw length", async (t) => {
   const dir = makeTempDir(t);
   const complete = path.join(dir, "done.slp");
   const partial = path.join(dir, "live.slp");
@@ -29,12 +24,25 @@ test("isSlpFileComplete detects the metadata marker", async (t) => {
   await assert.rejects(isSlpFileComplete(path.join(dir, "missing.slp")));
 });
 
-test("isSlpFileComplete finds a marker split across read chunks", async (t) => {
-  const file = path.join(makeTempDir(t), "big.slp");
-  // Reads are 1 MiB; place the marker straddling that boundary.
-  const filler = Buffer.alloc((1 << 20) - 4, 0x41);
-  fs.writeFileSync(file, Buffer.concat([filler, SLP_METADATA_MARKER, Buffer.from("}")]));
-  assert.equal(await isSlpFileComplete(file), true);
+test("readSlpRawLength handles truncated and foreign files", async (t) => {
+  const dir = makeTempDir(t);
+  const truncated = path.join(dir, "start.slp");
+  const empty = path.join(dir, "empty.slp");
+  const foreign = path.join(dir, "other.slp");
+  fs.writeFileSync(truncated, Buffer.from("{U\x03ra", "latin1"));
+  fs.writeFileSync(empty, "");
+  fs.writeFileSync(foreign, "not a replay file at all");
+
+  assert.equal(await readSlpRawLength(truncated), 0);
+  assert.equal(await readSlpRawLength(empty), 0);
+  assert.equal(await readSlpRawLength(foreign), null);
+  assert.equal(await isSlpFileComplete(foreign), true);
+});
+
+test("a metadata-like byte sequence inside a live game does not mark it complete", async (t) => {
+  const file = path.join(makeTempDir(t), "tricky.slp");
+  fs.writeFileSync(file, Buffer.concat([partialSlpBytes(), Buffer.from([0x55, 0x08]), Buffer.from("metadata")]));
+  assert.equal(await isSlpFileComplete(file), false);
 });
 
 test("streamSlpUpload tails a growing file until the game ends", async (t) => {
@@ -43,14 +51,13 @@ test("streamSlpUpload tails a growing file until the game ends", async (t) => {
 
   const part1 = partialSlpBytes();
   const part2 = Buffer.from("more-frames", "latin1");
-  const part3 = completeSlpBytes();
   fs.writeFileSync(file, part1);
 
   const growth = (async () => {
     await new Promise((r) => setTimeout(r, 300));
     fs.appendFileSync(file, part2);
     await new Promise((r) => setTimeout(r, 300));
-    fs.appendFileSync(file, part3);
+    finishSlp(file);
   })();
 
   const result = await streamSlpUpload({
@@ -60,7 +67,6 @@ test("streamSlpUpload tails a growing file until the game ends", async (t) => {
   });
   await growth;
 
-  const expected = Buffer.concat([part1, part2, part3]);
   assert.equal(server.requests.length, 1);
   const req = server.requests[0];
   assert.equal(req.method, "POST");
@@ -68,10 +74,14 @@ test("streamSlpUpload tails a growing file until the game ends", async (t) => {
   assert.equal(req.headers["x-api-token"], "tok");
   assert.equal(req.headers.authorization, "Bearer tok");
   assert.equal(req.headers["x-filename"], "Game_live.slp");
-  assert.deepEqual(req.body, expected);
 
-  assert.equal(result.sizeBytes, expected.length);
-  assert.equal(result.hash, crypto.createHash("sha256").update(expected).digest("hex"));
+  // Everything after the header is streamed exactly as written.
+  const final = fs.readFileSync(file);
+  assert.equal(req.body.length, final.length);
+  assert.deepEqual(req.body.subarray(15), final.subarray(15));
+
+  assert.equal(result.sizeBytes, final.length);
+  assert.equal(result.hash, crypto.createHash("sha256").update(req.body).digest("hex"));
   assert.equal(result.remoteName, "remote.slp");
   assert.equal(result.remoteFolder, "f");
 });

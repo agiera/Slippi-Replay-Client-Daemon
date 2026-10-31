@@ -6,24 +6,43 @@ Cross-platform Electron tray app that watches a local replay directory and uploa
 
 - Runs as a tray app on Linux, macOS, and Windows
 - Watches a folder recursively for new or changed replay files
-- Upload queue with retries
-- Deduplicates uploads by SHA-256 hash
-- Saves config and upload state under Electron user data
+- Live-streams games while they are being recorded; uploads finished replays two at a time
+- Upload retries, plus a periodic rescan that picks up anything that still failed
+- Deduplicates uploads by SHA-256 hash; unchanged files are skipped by size/mtime without being re-read
+- Saves config and upload state under Electron user data (written atomically)
+- Stores the API token encrypted with the OS keychain when available
 
 ## Configuration
 
-Create `.env` from `.env.example`:
+Settings can be changed from the tray menu, or overridden with environment
+variables. Environment variables are read from a `.env` file in the Electron
+user data directory (see [Logs](#logs) for its location per platform), then
+from a `.env` next to `main.js` for development:
 
 ```bash
 cp .env.example .env
 ```
 
-Set at minimum:
+Environment overrides apply at runtime only and are never written to
+`config.json`. Set at minimum:
 
 - `SLIPPI_REPLAY_SERVER_URL` (for example `http://localhost:8000`)
 - `SLIPPI_REPLAY_UPLOAD_PATH` (for example `/api/v1/uploads/files`)
 - `SLIPPI_REPLAY_SERVER_API_TOKEN`
 - `SLIPPI_REPLAY_WATCH_DIR`
+
+Optional:
+
+- `SLIPPI_REPLAY_USE_POLLING` (default `false`): poll the watch folder instead of
+  using native filesystem events. Only needed for network/remote filesystems;
+  polling checks every file in the folder each interval.
+- `SLIPPI_REPLAY_POLL_INTERVAL_MS` (default `2000`): polling interval, also used
+  to tail live games.
+- `SLIPPI_REPLAY_RESCAN_INTERVAL_MS` (default `300000`, `0` disables): how often
+  the whole folder is rescanned to retry failed uploads.
+
+Use an `https://` server URL for anything other than a local server; the
+daemon logs a warning when the API token would be sent over plain HTTP.
 
 ## Development
 
@@ -47,15 +66,26 @@ npm run build:mac
 - Shows active server endpoint and watch folder
 - Set server URL from a popup input
 - Set API token from a popup input
-- Choose watch folder
+- Choose watch folder (existing replays in it are uploaded immediately)
 - Sync immediately
 - Open app config directory
 - Open daemon log file
-- Toggle open-at-login
+- Toggle open-at-login (Linux uses an XDG autostart entry in
+  `~/.config/autostart/slippi-replay-sync.desktop`)
+
+## Live Games
+
+A `.slp` header stores the length of the game data, which Dolphin/Slippi
+Launcher leave at `0` while a game is being recorded and fill in when it ends.
+Files with a `0` length are streamed to `<upload path>/stream` as they grow;
+the stream ends once the header is filled in and the file stops growing, or
+after 10 minutes without new data. Live streams run independently of the
+upload queue, so they never delay other uploads.
 
 ## Logs
 
 The daemon writes logs to `daemon.log` in the Electron user data directory.
+When it passes 5 MB it is rotated to `daemon.log.1` (one previous file is kept).
 
 - Linux: `~/.config/Slippi Replay Sync/daemon.log`
 - macOS: `~/Library/Application Support/Slippi Replay Sync/daemon.log`
@@ -69,3 +99,5 @@ The daemon sends `multipart/form-data` with field name `file` and includes both 
 - `X-API-Token: <token>`
 
 Your server upload endpoint should accept one of these auth methods and a replay file payload.
+Full uploads also send `X-Content-SHA256: <hex digest>`; a `409` response is
+treated as "already uploaded" and recorded like a success.

@@ -13,17 +13,17 @@ test("isReplayFile matches extensions case-insensitively", () => {
   assert.equal(isReplayFile("/a/slp", [".slp"]), false);
 });
 
-test("walkDir visits files recursively and tolerates missing dirs", (t) => {
+test("walkDir visits files recursively and tolerates missing dirs", async (t) => {
   const dir = makeTempDir(t);
   fs.mkdirSync(path.join(dir, "a", "b"), { recursive: true });
   fs.writeFileSync(path.join(dir, "root.slp"), "");
   fs.writeFileSync(path.join(dir, "a", "b", "deep.slp"), "");
 
   const seen = [];
-  walkDir(dir, (file) => seen.push(path.relative(dir, file)));
+  await walkDir(dir, (file) => seen.push(path.relative(dir, file)));
   assert.deepEqual(seen.sort(), [path.join("a", "b", "deep.slp"), "root.slp"].sort());
 
-  assert.doesNotThrow(() => walkDir(path.join(dir, "missing"), () => assert.fail()));
+  await walkDir(path.join(dir, "missing"), () => assert.fail());
 });
 
 function makeWatcher(overrides) {
@@ -39,7 +39,7 @@ function makeWatcher(overrides) {
   return { watcher, events };
 }
 
-test("scanNow enqueues only replay files", (t) => {
+test("scanNow enqueues only replay files", async (t) => {
   const dir = makeTempDir(t);
   fs.writeFileSync(path.join(dir, "one.slp"), "");
   fs.writeFileSync(path.join(dir, "notes.txt"), "");
@@ -47,15 +47,15 @@ test("scanNow enqueues only replay files", (t) => {
   fs.writeFileSync(path.join(dir, "sub", "two.SLP"), "");
 
   const { watcher, events } = makeWatcher({ watchDir: dir });
-  watcher.scanNow();
+  await watcher.scanNow();
   assert.deepEqual(events.candidates.map((f) => path.basename(f)).sort(), ["one.slp", "two.SLP"].sort());
 });
 
-test("scanNow and start report missing directories", (t) => {
+test("scanNow and start report missing directories", async (t) => {
   const missing = path.join(makeTempDir(t), "nope");
 
   const { watcher, events } = makeWatcher({ watchDir: missing });
-  watcher.scanNow();
+  await watcher.scanNow();
   watcher.start();
   assert.deepEqual(events.statuses, ["Watch directory not found", "Watch directory does not exist"]);
 
@@ -79,4 +79,17 @@ test("start detects newly added replay files", async (t) => {
 
   await waitFor(() => events.candidates.includes(replay));
   assert.ok(events.candidates.every((f) => f.endsWith(".slp")));
+});
+
+test("start can use polling for network filesystems", async (t) => {
+  const dir = makeTempDir(t);
+  const { watcher, events } = makeWatcher({ watchDir: dir, usePolling: true });
+  watcher.start();
+  t.after(() => watcher.stop());
+  assert.match(events.logs.at(-1), /\(polling\)$/);
+
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const replay = path.join(dir, "polled.slp");
+  fs.writeFileSync(replay, "x");
+  await waitFor(() => events.candidates.includes(replay));
 });

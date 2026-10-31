@@ -6,39 +6,42 @@ function isReplayFile(filePath, includeExtensions) {
   return includeExtensions.includes(path.extname(filePath).toLowerCase());
 }
 
-function walkDir(rootDir, onFile) {
-  if (!fs.existsSync(rootDir)) {
+// Asynchronous recursive walk so large replay archives never block the Electron
+// main process. Unreadable directories are skipped.
+async function walkDir(rootDir, onFile) {
+  let dir;
+  try {
+    dir = await fs.promises.opendir(rootDir);
+  } catch {
     return;
   }
 
-  const items = fs.readdirSync(rootDir, { withFileTypes: true });
-  for (const item of items) {
+  for await (const item of dir) {
     const fullPath = path.join(rootDir, item.name);
     if (item.isDirectory()) {
-      walkDir(fullPath, onFile);
+      await walkDir(fullPath, onFile);
     } else if (item.isFile()) {
       onFile(fullPath);
     }
   }
 }
 
-function createWatcher({ watchDir, includeExtensions, pollIntervalMs, onCandidate, onStatus, onLog }) {
+function createWatcher({ watchDir, includeExtensions, pollIntervalMs, usePolling = false, onCandidate, onStatus, onLog }) {
   let watcher = null;
 
   function enqueueIfReplay(filePath) {
     if (isReplayFile(filePath, includeExtensions)) {
-      onLog(`Replay candidate detected: ${filePath}`);
       onCandidate(filePath);
     }
   }
 
-  function scanNow() {
+  async function scanNow() {
     if (!watchDir || !fs.existsSync(watchDir)) {
       onStatus("Watch directory not found");
       return;
     }
 
-    walkDir(watchDir, (filePath) => enqueueIfReplay(filePath));
+    await walkDir(watchDir, (filePath) => enqueueIfReplay(filePath));
     onLog(`Completed scan for ${watchDir}`);
   }
 
@@ -59,10 +62,12 @@ function createWatcher({ watchDir, includeExtensions, pollIntervalMs, onCandidat
     // as they appear so they can be streamed while still being written. The
     // uploader routes incomplete .slp files to live streaming and waits for a
     // stable size before fully uploading complete files, so early events are safe.
+    // Native filesystem events are used by default; polling stats every file in
+    // the tree each interval and is only needed for network/remote filesystems.
     watcher = chokidar.watch(watchDir, {
       persistent: true,
       ignoreInitial: true,
-      usePolling: true,
+      usePolling: Boolean(usePolling),
       interval: Math.max(200, pollIntervalMs),
     });
 
@@ -71,7 +76,7 @@ function createWatcher({ watchDir, includeExtensions, pollIntervalMs, onCandidat
     watcher.on("error", (error) => onStatus(`Watcher error: ${error.message}`));
 
     onStatus(`Watching: ${watchDir}`);
-    onLog(`Watcher started for ${watchDir}`);
+    onLog(`Watcher started for ${watchDir}${usePolling ? " (polling)" : ""}`);
   }
 
   function stop() {

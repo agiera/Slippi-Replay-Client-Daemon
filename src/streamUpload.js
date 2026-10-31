@@ -4,9 +4,12 @@ const crypto = require("crypto");
 const { Readable } = require("stream");
 const axios = require("axios");
 
-// A finished Slippi game always contains the UBJSON `metadata` key ("U\x08metadata"),
-// written only once the game ends and the root object is closed.
-const SLP_METADATA_MARKER = Buffer.concat([Buffer.from([0x55, 0x08]), Buffer.from("metadata", "ascii")]);
+// Every .slp starts with the UBJSON prefix `{U\x03raw[$U#l` followed by a
+// big-endian uint32 length of the raw event payload. Dolphin/Launcher write 0
+// there while the game is in progress and patch in the real length when the
+// game ends, so the first 15 bytes are enough to tell a live file from a done one.
+const SLP_RAW_HEADER = Buffer.from("{U\x03raw[$U#l", "latin1");
+const SLP_HEADER_LENGTH = SLP_RAW_HEADER.length + 4;
 
 // A live game with no new bytes for this long is treated as abandoned; whatever
 // has been streamed so far is finalized by the server ("upload what we have").
@@ -19,31 +22,36 @@ function buildStreamUrl(serverUrl, uploadPath) {
   return `${safeServerUrl}${trimmed}/stream`;
 }
 
-// Resolve once we can tell whether a .slp already holds its end-of-game footer.
-function isSlpFileComplete(filePath) {
-  return new Promise((resolve, reject) => {
-    const stream = fs.createReadStream(filePath, { highWaterMark: 1 << 20 });
-    let carry = Buffer.alloc(0);
-    let found = false;
+// Returns the raw payload length from the header: 0 while the game is still being
+// written, >0 once finished, or null if the file is not a recognizable .slp.
+async function readSlpRawLength(filePath) {
+  const handle = await fs.promises.open(filePath, "r");
+  try {
+    const header = Buffer.alloc(SLP_HEADER_LENGTH);
+    const { bytesRead } = await handle.read(header, 0, SLP_HEADER_LENGTH, 0);
+    const prefixLength = Math.min(bytesRead, SLP_RAW_HEADER.length);
+    if (!header.subarray(0, prefixLength).equals(SLP_RAW_HEADER.subarray(0, prefixLength))) {
+      return null;
+    }
+    if (bytesRead < SLP_HEADER_LENGTH) {
+      // Header not fully written yet: the game has only just started.
+      return 0;
+    }
+    return header.readUInt32BE(SLP_RAW_HEADER.length);
+  } finally {
+    await handle.close();
+  }
+}
 
-    stream.on("data", (chunk) => {
-      const buf = carry.length ? Buffer.concat([carry, chunk]) : chunk;
-      if (buf.includes(SLP_METADATA_MARKER)) {
-        found = true;
-        stream.destroy();
-        return;
-      }
-      carry = buf.subarray(Math.max(0, buf.length - (SLP_METADATA_MARKER.length - 1)));
-    });
-    stream.on("error", (err) => (found ? resolve(true) : reject(err)));
-    stream.on("close", () => resolve(found));
-    stream.on("end", () => resolve(found));
-  });
+// Unrecognized files are reported as complete so they take the normal upload path.
+async function isSlpFileComplete(filePath) {
+  const rawLength = await readSlpRawLength(filePath);
+  return rawLength !== 0;
 }
 
 // A Readable that tails a growing .slp: it emits newly written bytes as they
-// appear and ends the stream once the UBJSON container closes (metadata written
-// and file no longer growing), the idle timeout elapses, or the file disappears.
+// appear and ends once the header reports the game finished and the file stops
+// growing, the idle timeout elapses, or the file disappears.
 class SlpTailStream extends Readable {
   constructor({ filePath, pollIntervalMs, idleTimeoutMs, onLog }) {
     super();
@@ -52,8 +60,6 @@ class SlpTailStream extends Readable {
     this.idleTimeoutMs = idleTimeoutMs || STREAM_IDLE_TIMEOUT_MS;
     this.onLog = onLog || (() => {});
     this.offset = 0;
-    this.carry = Buffer.alloc(0);
-    this.metadataSeen = false;
     this.lastProgress = Date.now();
     this.lastSize = -1;
     this.timer = null;
@@ -68,6 +74,15 @@ class SlpTailStream extends Readable {
       return;
     }
     this._scheduleTick(0);
+  }
+
+  _destroy(err, callback) {
+    this.finished = true;
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    callback(err);
   }
 
   _scheduleTick(delay) {
@@ -87,8 +102,10 @@ class SlpTailStream extends Readable {
     this.reading = true;
 
     let stat;
+    let rawLength;
     try {
       stat = await fs.promises.stat(this.filePath);
+      rawLength = await readSlpRawLength(this.filePath);
     } catch {
       this.reading = false;
       this._finish(null);
@@ -104,18 +121,11 @@ class SlpTailStream extends Readable {
       this.lastProgress = Date.now();
       this.hash.update(chunk);
       this.bytesStreamed += chunk.length;
-
-      const scan = this.carry.length ? Buffer.concat([this.carry, chunk]) : chunk;
-      if (!this.metadataSeen && scan.includes(SLP_METADATA_MARKER)) {
-        this.metadataSeen = true;
-      }
-      this.carry = scan.subarray(Math.max(0, scan.length - (SLP_METADATA_MARKER.length - 1)));
-
       backpressured = !this.push(chunk);
     }
 
-    if (this.metadataSeen && size === this.offset && size === this.lastSize) {
-      // Game finished: footer written and the file stopped growing.
+    if (rawLength !== 0 && size === this.offset && size === this.lastSize) {
+      // Game finished: header length patched in and the file stopped growing.
       this.reading = false;
       this._finish(null);
       return;
@@ -164,8 +174,8 @@ class SlpTailStream extends Readable {
   }
 }
 
-// Live-stream a growing .slp to the server, returning the final content hash and
-// size once the transfer completes.
+// Live-stream a growing .slp to the server, returning the hash and size of the
+// bytes streamed once the transfer completes.
 async function streamSlpUpload({ filePath, config, onLog }) {
   const tail = new SlpTailStream({
     filePath,
@@ -175,17 +185,22 @@ async function streamSlpUpload({ filePath, config, onLog }) {
   });
 
   const uploadUrl = buildStreamUrl(config.serverUrl, config.uploadPath);
-  const response = await axios.post(uploadUrl, tail, {
-    maxContentLength: Infinity,
-    maxBodyLength: Infinity,
-    headers: {
-      Authorization: `Bearer ${config.apiToken}`,
-      "X-API-Token": config.apiToken,
-      "X-Filename": path.basename(filePath),
-      "Content-Type": "application/octet-stream",
-    },
-    timeout: 0,
-  });
+  let response;
+  try {
+    response = await axios.post(uploadUrl, tail, {
+      maxContentLength: Infinity,
+      maxBodyLength: Infinity,
+      headers: {
+        Authorization: `Bearer ${config.apiToken}`,
+        "X-API-Token": config.apiToken,
+        "X-Filename": path.basename(filePath),
+        "Content-Type": "application/octet-stream",
+      },
+      timeout: 0,
+    });
+  } finally {
+    tail.destroy();
+  }
 
   return {
     hash: tail.hash.digest("hex"),
@@ -196,9 +211,10 @@ async function streamSlpUpload({ filePath, config, onLog }) {
 }
 
 module.exports = {
-  SLP_METADATA_MARKER,
+  SLP_RAW_HEADER,
   STREAM_IDLE_TIMEOUT_MS,
   buildStreamUrl,
+  readSlpRawLength,
   isSlpFileComplete,
   streamSlpUpload,
 };

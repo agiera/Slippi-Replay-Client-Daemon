@@ -9,6 +9,8 @@ const {
   mergeEnvOverrides,
   normalizeConfig,
   parseExtensionsFromEnv,
+  getEnvOverrides,
+  isInsecureRemoteUrl,
 } = require("../src/config");
 const { makeTempDir, fakeApp } = require("./helpers");
 
@@ -44,6 +46,10 @@ test("normalizeConfig fills defaults and coerces types", () => {
   assert.deepEqual(defaults.includeExtensions, [".slp", ".zlp"]);
   assert.equal(defaults.pollIntervalMs, 2000);
   assert.equal(defaults.autoStart, true);
+  assert.equal(defaults.usePolling, false);
+  assert.equal(defaults.rescanIntervalMs, 300000);
+  assert.equal(normalizeConfig({ rescanIntervalMs: "abc" }).rescanIntervalMs, 300000);
+  assert.equal(normalizeConfig({ rescanIntervalMs: 0 }).rescanIntervalMs, 0);
 });
 
 test("loadConfig returns defaults when file is missing or corrupt", (t) => {
@@ -84,4 +90,54 @@ test("mergeEnvOverrides applies environment variables", (t) => {
   assert.deepEqual(merged.includeExtensions, [".slp"]);
   assert.equal(merged.pollIntervalMs, 750);
   assert.equal(merged.autoStart, false);
+});
+
+test("getEnvOverrides returns only values set in the environment", (t) => {
+  withEnv(t, { SLIPPI_REPLAY_SERVER_API_TOKEN: "env-only", SLIPPI_REPLAY_USE_POLLING: "true", SLIPPI_REPLAY_RESCAN_INTERVAL_MS: "1000" });
+  for (const key of ["SLIPPI_REPLAY_SERVER_URL", "SLIPPI_REPLAY_WATCH_DIR", "SLIPPI_REPLAY_UPLOAD_PATH"]) {
+    withEnv(t, { [key]: "" });
+  }
+  assert.deepEqual(getEnvOverrides(), { apiToken: "env-only", usePolling: true, rescanIntervalMs: 1000 });
+});
+
+const fakeSecretStore = {
+  encrypt: (value) => Buffer.from(`enc:${value}`).toString("base64"),
+  decrypt: (value) => {
+    const decoded = Buffer.from(value, "base64").toString();
+    if (!decoded.startsWith("enc:")) throw new Error("bad");
+    return decoded.slice(4);
+  },
+};
+
+test("saveConfig encrypts the API token when a secret store is available", (t) => {
+  const app = fakeApp(makeTempDir(t));
+  saveConfig(app, { apiToken: "secret-token" }, fakeSecretStore);
+
+  const raw = fs.readFileSync(path.join(app.getPath("userData"), "config.json"), "utf-8");
+  assert.ok(!raw.includes("secret-token"));
+  assert.equal(JSON.parse(raw).apiToken, "");
+  assert.equal(loadConfig(app, fakeSecretStore).apiToken, "secret-token");
+  assert.equal(loadConfig(app, fakeSecretStore).apiTokenEncrypted, undefined);
+});
+
+test("loadConfig flags a token that can no longer be decrypted", (t) => {
+  const dir = makeTempDir(t);
+  const app = fakeApp(dir);
+  fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({ apiTokenEncrypted: "garbage" }));
+  const config = loadConfig(app, fakeSecretStore);
+  assert.equal(config.apiToken, "");
+  assert.equal(config.apiTokenUnreadable, true);
+
+  saveConfig(app, config, fakeSecretStore);
+  assert.ok(!fs.readFileSync(path.join(dir, "config.json"), "utf-8").includes("apiTokenUnreadable"));
+});
+
+test("isInsecureRemoteUrl only flags plain HTTP to remote hosts", () => {
+  assert.equal(isInsecureRemoteUrl("http://replays.example.com"), true);
+  assert.equal(isInsecureRemoteUrl("http://192.168.1.5:8000"), true);
+  assert.equal(isInsecureRemoteUrl("https://replays.example.com"), false);
+  assert.equal(isInsecureRemoteUrl("http://localhost:8000"), false);
+  assert.equal(isInsecureRemoteUrl("http://127.0.0.1:8000"), false);
+  assert.equal(isInsecureRemoteUrl("http://[::1]:8000"), false);
+  assert.equal(isInsecureRemoteUrl("not a url"), false);
 });

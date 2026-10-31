@@ -47,7 +47,7 @@ function waitFor(predicate, { timeoutMs = 10000, intervalMs = 25 } = {}) {
   });
 }
 
-// Bytes that look like a finished .slp: they contain the UBJSON metadata key.
+// Bytes that look like a finished .slp: the header's raw length is non-zero.
 function completeSlpBytes() {
   return Buffer.concat([
     Buffer.from("{U\x03raw[$U#l", "latin1"),
@@ -57,8 +57,20 @@ function completeSlpBytes() {
   ]);
 }
 
+// Bytes of a game still being recorded: the header's raw length is still 0.
 function partialSlpBytes() {
   return Buffer.from("{U\x03raw[$U#l\0\0\0\0frames", "latin1");
 }
 
-module.exports = { makeTempDir, fakeApp, startServer, waitFor, completeSlpBytes, partialSlpBytes };
+// Simulates Dolphin/Launcher ending a game: append the metadata footer and patch
+// the real raw length into the header in place.
+function finishSlp(filePath) {
+  fs.appendFileSync(filePath, Buffer.concat([Buffer.from([0x55, 0x08]), Buffer.from("metadata{}}", "latin1")]));
+  const length = Buffer.alloc(4);
+  length.writeUInt32BE(Math.max(1, fs.statSync(filePath).size - 15 - 13));
+  const fd = fs.openSync(filePath, "r+");
+  fs.writeSync(fd, length, 0, 4, 11);
+  fs.closeSync(fd);
+}
+
+module.exports = { makeTempDir, fakeApp, startServer, waitFor, completeSlpBytes, partialSlpBytes, finishSlp };
